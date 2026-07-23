@@ -113,6 +113,18 @@ async function runEval() {
   console.log('🧪 Triple-pi Memory Eval\n');
   console.log(`   ${cases.length} test suites\n`);
 
+  // Eval uses a temp HOME to avoid touching real memory files.
+  const evalHome = path.join(__dirname, '.eval-home');
+  if (fs.existsSync(evalHome)) fs.rmSync(evalHome, { recursive: true, force: true });
+  fs.mkdirSync(path.join(evalHome, '.triple-pi', 'memory'), { recursive: true });
+
+  // Copy auth.json so extractor can access LLM API key
+  const realAuth = path.join(process.env.HOME, '.pi', 'agent', 'auth.json');
+  if (fs.existsSync(realAuth)) {
+    fs.mkdirSync(path.join(evalHome, '.pi', 'agent'), { recursive: true });
+    fs.copyFileSync(realAuth, path.join(evalHome, '.pi', 'agent', 'auth.json'));
+  }
+
   let totalPassed = 0;
   let totalFailed = 0;
 
@@ -212,10 +224,14 @@ async function runExtraction(transcriptPath) {
   const extractScript = path.join(PROJECT_DIR, 'scripts', 'extract.mjs');
   const absoluteTranscript = path.resolve(transcriptPath);
 
+  // Run extractor with temp HOME so eval doesn't touch real memory files
+  const evalHome = path.join(__dirname, '.eval-home');
+  const env = { ...process.env, HOME: evalHome };
+
   try {
     const output = execSync(
       `node "${extractScript}" "${absoluteTranscript}" 2>&1`,
-      { cwd: PROJECT_DIR, timeout: 120000, encoding: 'utf-8' }
+      { cwd: PROJECT_DIR, timeout: 120000, encoding: 'utf-8', env }
     );
 
     // Parse saved memories from the output
@@ -228,16 +244,36 @@ async function runExtraction(transcriptPath) {
 
 function parseExtractorOutput(output) {
   const saved = [];
-  // Parse lines like: ✅ [category] "title" (score: 0.xxx)
-  const savedRegex = /✅\s+\[(\w+)\]\s+"(.+?)"\s+\(score:\s*([\d.]+)\)/g;
+
+  // Method 1: candidates after Phase 2.5 review (before merge dedup)
+  // Line: "X candidates → Y after review"
+  // Then each line: ✅ [cat] "title" (score) — saved (not merged away)
+  // OR 🔗 lines for merged items
+  // Fallback: if Phase 2.5 output is empty, use Phase 3 "Saved" lines
+
+  // Collect ALL candidates: first from ✅ lines, then from 🔗 merge lines
+  const candidateRegex = /✅\s+\[(\w+)\]\s+"(.+?)"\s+\(score:\s*([\d.]+)\)/g;
+  const mergeRegex = /🔗\s+\w+:\s+"(.+?)"\s+↔\s+"(.+?)"/g;
+
   let match;
-  while ((match = savedRegex.exec(output)) !== null) {
-    saved.push({
-      category: match[1],
-      title: match[2],
-      score: parseFloat(match[3]),
-    });
+  const seen = new Set();
+
+  while ((match = candidateRegex.exec(output)) !== null) {
+    const title = match[2];
+    if (!seen.has(title)) {
+      seen.add(title);
+      saved.push({ category: match[1], title, score: parseFloat(match[3]) });
+    }
   }
+
+  while ((match = mergeRegex.exec(output)) !== null) {
+    const title = match[2]; // the candidate that was merged into existing
+    if (!seen.has(title)) {
+      seen.add(title);
+      saved.push({ category: 'merged', title, score: 0 });
+    }
+  }
+
   return { saved, raw: output };
 }
 

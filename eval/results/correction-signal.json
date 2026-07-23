@@ -1,0 +1,21 @@
+{
+  "testCase": "correction-signal",
+  "saved": [
+    {
+      "category": "decision",
+      "title": "Use JWT instead of session for auth",
+      "score": 0.609
+    },
+    {
+      "category": "rule",
+      "title": "Never modify .env file",
+      "score": 0.471
+    },
+    {
+      "category": "preference",
+      "title": "Use Tailwind CSS for styling",
+      "score": 0.415
+    }
+  ],
+  "timestamp": "2026-07-23T13:49:08.822Z"
+}

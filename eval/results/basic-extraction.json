@@ -1,0 +1,26 @@
+{
+  "testCase": "basic-extraction",
+  "saved": [
+    {
+      "category": "decision",
+      "title": "认证方式选择 JWT 而非 session+cookie",
+      "score": 0.56
+    },
+    {
+      "category": "knowledge",
+      "title": "用户已阅读 agent-loop.ts 源码",
+      "score": 0.412
+    },
+    {
+      "category": "preference",
+      "title": "函数式编程风格，禁止 class",
+      "score": 0.374
+    },
+    {
+      "category": "rule",
+      "title": "禁止 git push 到 main 分支",
+      "score": 0.358
+    }
+  ],
+  "timestamp": "2026-07-23T13:49:00.853Z"
+}

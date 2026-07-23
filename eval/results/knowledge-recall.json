@@ -1,0 +1,16 @@
+{
+  "testCase": "knowledge-recall",
+  "saved": [
+    {
+      "category": "knowledge",
+      "title": "用户不熟悉 Docker",
+      "score": 0.564
+    },
+    {
+      "category": "knowledge",
+      "title": "用户已熟悉 Pi agent-loop.ts 源码",
+      "score": 0.374
+    }
+  ],
+  "timestamp": "2026-07-23T13:49:04.931Z"
+}
