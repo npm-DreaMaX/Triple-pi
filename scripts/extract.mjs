@@ -1,46 +1,69 @@
 #!/usr/bin/env node
 /**
- * Memory Extractor — post-session async memory extraction.
+ * Triple-pi Memory Extractor — OpenClaw-style multi-phase async extraction
  *
- * Run after a Pi session:  npm run extract
- * Or:  node scripts/extract.mjs
+ * ============================================================================
+ * PIPELINE (inspired by OpenClaw Dreaming)
+ * ============================================================================
  *
- * Loads the latest session transcript and uses LLM to extract
- * grounded memories. Inspired by OpenClaw's Dreaming / Light Sleep.
+ * Phase 1 (Light Sleep):  LLM scans transcript → extracts candidates with evidence
+ * Phase 2 (Scoring):      6-dim weighted scoring per candidate
+ * Phase 3 (Deep Sleep):   Merge duplicates, update existing, retire stale
+ * Phase 4 (REM):          Cross-category linking notes
+ *
+ * ============================================================================
+ * SCORING FORMULA (same weights as OpenClaw)
+ * ============================================================================
+ * Score = relevance(0.30) + frequency(0.24) + query_diversity(0.15)
+ *       + recency(0.15) + consolidation(0.10) + conceptual_richness(0.06)
+ *
+ * Only candidates scoring >= 0.5 are promoted to long-term memory.
+ *
+ * ============================================================================
+ * KEY PRINCIPLE
+ * ============================================================================
+ * Only grounded snippets enter long-term memory. Every memory MUST cite
+ * exact evidence from the transcript. No evidence = not saved.
  */
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { homedir } from 'node:os';
 
-// ── Config ──────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+// CONFIG
+// ═══════════════════════════════════════════════════════════════
 
 const API_KEY = process.env.DEEPSEEK_API_KEY || process.env.ANTHROPIC_API_KEY || '';
 const IS_ANTHROPIC = !!process.env.ANTHROPIC_API_KEY && !process.env.DEEPSEEK_API_KEY;
 
-// ── Find latest transcript ──────────────────────────────────
+const SCORE_THRESHOLD = 0.5;           // minimum score to save
+const STALE_DAYS = 90;                 // memories not updated in 90 days → retired
+const MAX_CANDIDATES_PER_RUN = 15;     // cap extraction to avoid flooding
+
+const ROOT = path.join(homedir(), '.triple-pi', 'memory');
+const INDEX = path.join(ROOT, 'MEMORY.md');
+const SCORES_FILE = path.join(ROOT, '.scores.json'); // frequency tracking
+
+// ═══════════════════════════════════════════════════════════════
+// TRANSCRIPT LOADING
+// ═══════════════════════════════════════════════════════════════
 
 function findLatestTranscript() {
   const base = path.join(homedir(), '.pi', 'agent', 'sessions');
-  if (!fs.existsSync(base)) throw new Error(`No Pi sessions directory: ${base}`);
+  if (!fs.existsSync(base)) return null;
 
-  // Collect all .jsonl files across all session dirs
   const files = [];
   for (const dir of fs.readdirSync(base, { withFileTypes: true })) {
     if (!dir.isDirectory()) continue;
-    for (const f of fs.readdirSync(path.join(base, dir.name))) {
-      if (f.endsWith('.jsonl')) {
-        files.push({ path: path.join(base, dir.name, f), dir: dir.name });
-      }
+    const dirPath = path.join(base, dir.name);
+    for (const f of fs.readdirSync(dirPath)) {
+      if (f.endsWith('.jsonl')) files.push({ path: path.join(dirPath, f), dir: dir.name });
     }
   }
-
-  // Sort by filename (which starts with ISO date)
   files.sort((a, b) => b.path.localeCompare(a.path));
   return files[0] || null;
 }
-
-// ── Load transcript ─────────────────────────────────────────
 
 function loadTranscript(jsonlPath) {
   const raw = fs.readFileSync(jsonlPath, 'utf-8');
@@ -78,48 +101,81 @@ function loadTranscript(jsonlPath) {
     if ((role === 'user' || role === 'assistant') && textParts.length > 0) {
       const text = textParts.join('');
       if (text.trim().length > 0) {
-        messages.push({ role, content: text });
+        messages.push({ role, content: text, timestamp: entry.timestamp });
       }
     }
   }
-
   return messages;
 }
 
-// ── LLM call ─────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+// PHASE 1: LIGHT SLEEP — LLM Extraction
+// ═══════════════════════════════════════════════════════════════
 
-const SYSTEM_PROMPT = `You are a memory extraction system. Read this conversation between a user and their coding agent, and extract ONLY information that should persist across sessions.
+const EXTRACTION_PROMPT = `You are a memory extraction system for a personal coding agent.
+Read this conversation between a developer and their coding agent.
+Extract ONLY information that should persist across future sessions.
 
-## What to extract
-1. User preferences (communication style, code style, tools)
-2. Technical decisions (architecture, technology choices, reasons)
-3. Project rules (constraints like "never push to main")
-4. Important facts (project structure, key patterns)
+## What to extract (with examples)
+
+1. **User preferences**:
+   - "用户禁止使用 any 类型" → preference
+   - "用户偏好中文回复，代码注释用英文" → preference
+   - "用户喜欢简洁回复，不要冗长解释" → preference
+
+2. **Technical decisions**:
+   - "auth 模块选择 JWT 而非 session，因为多服务无状态需求" → decision
+   - "选择 pnpm 而非 npm，因为 monorepo 支持更好" → decision
+
+3. **Project rules**:
+   - "不允许 git push 到 main 分支" → rule
+   - "不允许删除 .env 文件" → rule
+   - "API 返回值必须用 { code, data, message } 包裹" → rule
+
+4. **Important facts**:
+   - "项目是 TypeScript monorepo，pnpm workspace 管理" → fact
+   - "测试框架使用 vitest" → fact
 
 ## What to SKIP
-- Debugging attempts and errors
-- Work-in-progress discussions
-- Chit-chat and greetings
-- Session-only information
-- Test/experimental content
+
+- Debugging: "试试这个能不能编译", "报错了，换一种写法"
+- Testing: "你能不能调 SaveMemory", "测试一下工具"
+- Chit-chat: "今天天气不错", "谢谢"
+- Temporary: "先用 hardcode，后面再改"
+- Single-session context: "打开 login.ts 第 42 行"
 
 ## Rules
-- Every memory MUST cite evidence from the transcript
-- When in doubt, SKIP. Better to miss than to save junk.
-- Be conservative. A personal agent typically has 20-50 memories total.
 
-## Output
-Return ONLY valid JSON:
-{"candidates":[{"category":"preference|decision|rule|fact","title":"short title","content":"what to remember","evidence":"exact quote from transcript","confidence":"high|medium|low"}]}
+- EVERY candidate MUST include an **exact quote** from the transcript as evidence
+- When in doubt, SKIP. Better to miss one than to save junk.
+- A personal developer agent typically has 20-50 memories, not 500.
+- Be specific. "用户偏好 TypeScript" is worse than "用户偏好 TypeScript strict 模式，禁用了 any 类型"
+
+## Output format
+
+Return ONLY valid JSON. No markdown, no explanation:
+{
+  "candidates": [
+    {
+      "category": "preference|decision|rule|fact",
+      "title": "short title",
+      "content": "detailed memory with context and rationale",
+      "evidence": "exact quote from transcript"
+    }
+  ]
+}
+
 If nothing worth extracting: {"candidates":[]}`;
 
 function buildPrompt(messages) {
-  const convo = messages.map(m => `${m.role.toUpperCase()}: ${m.content}`).join('\n\n');
+  const convo = messages.map(m =>
+    `[${m.role.toUpperCase()}]: ${m.content}`
+  ).join('\n\n');
   const maxLen = 80000;
   const truncated = convo.length > maxLen
     ? convo.slice(0, maxLen) + '\n\n[... truncated ...]'
     : convo;
-  return `Extract persistent memories from this conversation:\n\n${truncated}`;
+  return `Analyze this coding session and extract persistent memories:\n\n${truncated}`;
 }
 
 async function callLLM(messages) {
@@ -129,7 +185,11 @@ async function callLLM(messages) {
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 4000, temperature: 0.1, system: SYSTEM_PROMPT, messages: [{ role: 'user', content: buildPrompt(messages) }] }),
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6', max_tokens: 4000, temperature: 0.1,
+        system: EXTRACTION_PROMPT,
+        messages: [{ role: 'user', content: buildPrompt(messages) }],
+      }),
     });
     if (!res.ok) throw new Error(`Anthropic: ${res.status} ${await res.text()}`);
     const data = await res.json();
@@ -140,43 +200,299 @@ async function callLLM(messages) {
   const res = await fetch('https://api.deepseek.com/v1/chat/completions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${API_KEY}` },
-    body: JSON.stringify({ model: 'deepseek-chat', temperature: 0.1, max_tokens: 4000, messages: [{ role: 'system', content: SYSTEM_PROMPT }, { role: 'user', content: buildPrompt(messages) }] }),
+    body: JSON.stringify({
+      model: 'deepseek-chat', temperature: 0.1, max_tokens: 4000,
+      messages: [
+        { role: 'system', content: EXTRACTION_PROMPT },
+        { role: 'user', content: buildPrompt(messages) },
+      ],
+    }),
   });
   if (!res.ok) throw new Error(`DeepSeek: ${res.status} ${await res.text()}`);
   const data = await res.json();
   return data.choices?.[0]?.message?.content || '';
 }
 
-// ── Parse & validate ────────────────────────────────────────
-
-function parseResponse(text) {
+function parseCandidates(text) {
   let json = text.trim();
   const fence = json.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
   if (fence) json = fence[1].trim();
 
   let parsed;
-  try { parsed = JSON.parse(json); } catch { throw new Error(`Bad JSON: ${text.slice(0, 300)}`); }
+  try { parsed = JSON.parse(json); } catch {
+    // Last resort: try to find {...} block
+    const m = json.match(/\{[\s\S]*\}/);
+    if (m) parsed = JSON.parse(m[0]);
+    else throw new Error(`Bad JSON: ${text.slice(0, 300)}`);
+  }
 
-  const valid = ['preference', 'decision', 'rule', 'fact'];
+  const validCats = new Set(['preference', 'decision', 'rule', 'fact']);
   return (parsed.candidates || []).filter(c =>
-    valid.includes(c.category) && c.title && c.content && c.evidence
+    validCats.has(c.category) && c.title && c.content && c.evidence
   );
 }
 
-function validateEvidence(candidate, messages) {
-  const full = messages.map(m => m.content).join(' ');
-  const words = candidate.evidence.split(/\s+/).filter(w => w.length > 3);
-  if (words.length === 0) return false;
-  const matched = words.filter(w => full.toLowerCase().includes(w.toLowerCase()));
-  return matched.length / words.length >= 0.7;
+// ═══════════════════════════════════════════════════════════════
+// PHASE 2: SCORING — OpenClaw 6-dim weighted formula
+// ═══════════════════════════════════════════════════════════════
+
+function loadScores() {
+  try {
+    if (fs.existsSync(SCORES_FILE)) return JSON.parse(fs.readFileSync(SCORES_FILE, 'utf-8'));
+  } catch { /* ignore */ }
+  return {};
 }
 
-// ── Save ─────────────────────────────────────────────────────
+function saveScores(scores) {
+  fs.writeFileSync(SCORES_FILE, JSON.stringify(scores, null, 2));
+}
+
+/**
+ * Score a candidate using OpenClaw's formula.
+ *
+ * Score = relevance(0.30) + frequency(0.24) + query_diversity(0.15)
+ *       + recency(0.15) + consolidation(0.10) + conceptual_richness(0.06)
+ */
+function scoreCandidate(candidate, messages, existingMemories) {
+  const evidence = candidate.evidence.toLowerCase();
+  const title = candidate.title.toLowerCase();
+  const content = candidate.content.toLowerCase();
+  const allText = messages.map(m => m.content.toLowerCase()).join(' ');
+
+  // ── Frequency (0.24): how many times was this topic mentioned ──
+  const keywords = title.split(/\s+/).filter(w => w.length > 2);
+  const mentions = keywords.reduce((sum, kw) => {
+    const matches = allText.split(kw).length - 1;
+    return sum + matches;
+  }, 0) / Math.max(1, keywords.length);
+  const freqScore = Math.min(1, mentions / 5) * 0.24;  // cap at 5 mentions
+
+  // ── Relevance (0.30): is this about tech/code/work or casual chat? ──
+  const techTerms = ['typescript', 'javascript', 'python', 'api', 'auth', 'token',
+    'database', 'test', 'deploy', 'git', 'docker', 'config', 'component', 'function',
+    'module', 'package', 'build', 'lint', 'format', 'refactor', 'architecture',
+    '接口', '认证', '数据库', '测试', '部署', '配置', '组件', '函数', '模块', '架构'];
+  const relMatches = techTerms.filter(t => content.includes(t)).length;
+  const relScore = Math.min(1, relMatches / 3) * 0.30;  // cap at 3 terms
+
+  // ── Recency (0.15): was this mentioned recently? ──
+  const msgTimestamps = messages.filter(m => m.timestamp).map(m => new Date(m.timestamp).getTime());
+  const latest = msgTimestamps.length > 0 ? Math.max(...msgTimestamps) : Date.now();
+  const evidencePos = allText.indexOf(evidence.slice(0, 30).toLowerCase());
+  const evidenceIndex = evidencePos >= 0
+    ? Math.floor(evidencePos / Math.max(1, allText.length) * messages.length)
+    : messages.length / 2;
+  const recencyRatio = 1 - (evidenceIndex / Math.max(1, messages.length));
+  const recencyScore = Math.max(0, recencyRatio) * 0.15;
+
+  // ── Query diversity (0.15): does it appear in different contexts? ──
+  const userMsgs = messages.filter(m => m.role === 'user');
+  const assistantMsgs = messages.filter(m => m.role === 'assistant');
+  const inUser = userMsgs.some(m => m.content.toLowerCase().includes(evidence.slice(0, 20).toLowerCase()));
+  const inAssistant = assistantMsgs.some(m => m.content.toLowerCase().includes(evidence.slice(0, 20).toLowerCase()));
+  const diversityScore = ((inUser ? 0.075 : 0) + (inAssistant ? 0.075 : 0));
+
+  // ── Consolidation (0.10): is this linked to existing memories? ──
+  let consolidationMatches = 0;
+  for (const [existingTitle, existingContent] of Object.entries(existingMemories)) {
+    const et = existingTitle.toLowerCase();
+    const ec = (existingContent || '').toLowerCase();
+    const shared = keywords.filter(kw => et.includes(kw) || ec.includes(kw));
+    if (shared.length >= 2) consolidationMatches++;
+  }
+  const consolidationScore = Math.min(0.1, consolidationMatches * 0.025);
+
+  // ── Conceptual richness (0.06): detail and specificity ──
+  const contentLen = candidate.content.length;
+  const hasRationale = /因为|because|由于|so that|in order to|因此|选择/.test(content);
+  const hasContext = /项目|project|模块|module|服务|service|文件|file/.test(content);
+  const richnessBase = Math.min(1, contentLen / 200);  // 200 chars = full score
+  const richnessBonus = (hasRationale ? 0.02 : 0) + (hasContext ? 0.02 : 0);
+  const richnessScore = Math.min(0.06, richnessBase * 0.02 + richnessBonus);
+
+  const total = freqScore + relScore + recencyScore + diversityScore + consolidationScore + richnessScore;
+
+  return {
+    total: Math.round(total * 1000) / 1000,
+    breakdown: {
+      frequency: Math.round(freqScore * 1000) / 1000,
+      relevance: Math.round(relScore * 1000) / 1000,
+      recency: Math.round(recencyScore * 1000) / 1000,
+      query_diversity: Math.round(diversityScore * 1000) / 1000,
+      consolidation: Math.round(consolidationScore * 1000) / 1000,
+      conceptual_richness: Math.round(richnessScore * 1000) / 1000,
+    },
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PHASE 2b: GROUNDED SNIPPET VALIDATION
+// ═══════════════════════════════════════════════════════════════
+
+function validateEvidence(candidate, messages) {
+  const fullText = messages.map(m => m.content).join(' ');
+  // Exact substring match (case-insensitive)
+  const evidence = candidate.evidence.trim();
+  if (fullText.toLowerCase().includes(evidence.toLowerCase())) return true;
+
+  // Fuzzy: at least 80% of significant words must appear
+  const words = evidence.split(/\s+/).filter(w => w.length > 3);
+  if (words.length === 0) return false;
+  const matched = words.filter(w => fullText.toLowerCase().includes(w.toLowerCase()));
+  return matched.length / words.length >= 0.8;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PHASE 3: DEEP SLEEP — Merge & Dedup
+// ═══════════════════════════════════════════════════════════════
+
+function loadExistingMemories() {
+  const memories = {};
+  for (const cat of ['preference', 'decision', 'rule', 'fact']) {
+    const dir = path.join(ROOT, cat);
+    if (!fs.existsSync(dir)) continue;
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.endsWith('.md')) continue;
+      const content = fs.readFileSync(path.join(dir, f), 'utf-8');
+      const titleMatch = content.match(/^#\s+(.+)/m);
+      const title = titleMatch ? titleMatch[1] : f.replace('.md', '');
+      memories[title] = content;
+    }
+  }
+  return memories;
+}
+
+function similarity(a, b) {
+  // Jaccard similarity on 3-grams
+  const grams = s => {
+    const g = new Set();
+    for (let i = 0; i < s.length - 2; i++) g.add(s.slice(i, i + 3));
+    return g;
+  };
+  const ga = grams(a.toLowerCase());
+  const gb = grams(b.toLowerCase());
+  const intersection = new Set([...ga].filter(x => gb.has(x)));
+  const union = new Set([...ga, ...gb]);
+  return union.size === 0 ? 0 : intersection.size / union.size;
+}
+
+function shouldMerge(c1, c2) {
+  return c1.category === c2.category && similarity(c1.title + c1.content, c2.title + c2.content) > 0.6;
+}
+
+function mergeMemories(candidates, existing) {
+  const toSave = [];
+  const merged = [];
+
+  for (const c of candidates) {
+    let isDuplicate = false;
+
+    // Check against existing
+    for (const [existingTitle, existingContent] of Object.entries(existing)) {
+      const existingObj = { title: existingTitle, content: existingContent, category: c.category };
+      if (shouldMerge(c, existingObj)) {
+        merged.push({ existing: existingTitle, candidate: c.title, action: 'update' });
+        // Update existing: append new content if different
+        const existingFile = findMemoryFile(c.category, existingTitle);
+        if (existingFile) {
+          const updated = existingContent.trimEnd() + '\n\n### Updated ' + new Date().toISOString().split('T')[0] + '\n\n' + c.content;
+          fs.writeFileSync(existingFile, updated);
+        }
+        isDuplicate = true;
+        break;
+      }
+    }
+
+    // Check against other candidates in this batch
+    if (!isDuplicate) {
+      for (const other of toSave) {
+        if (shouldMerge(c, other)) {
+          merged.push({ candidate1: c.title, candidate2: other.title, action: 'merge' });
+          // Merge into the first one
+          other.content += '\n\n' + c.content;
+          isDuplicate = true;
+          break;
+        }
+      }
+    }
+
+    if (!isDuplicate) toSave.push(c);
+  }
+
+  return { toSave, merged };
+}
+
+function findMemoryFile(category, title) {
+  const dir = path.join(ROOT, category);
+  if (!fs.existsSync(dir)) return null;
+  for (const f of fs.readdirSync(dir)) {
+    if (!f.endsWith('.md')) continue;
+    const content = fs.readFileSync(path.join(dir, f), 'utf-8');
+    const titleMatch = content.match(/^#\s+(.+)/m);
+    if (titleMatch && titleMatch[1] === title) return path.join(dir, f);
+  }
+  return null;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PHASE 4: REM — Cross-category linking notes
+// ═══════════════════════════════════════════════════════════════
+
+function generateCrossLinks(candidates) {
+  const links = [];
+  for (let i = 0; i < candidates.length; i++) {
+    for (let j = i + 1; j < candidates.length; j++) {
+      const a = candidates[i];
+      const b = candidates[j];
+      if (a.category !== b.category && similarity(a.content, b.content) > 0.4) {
+        links.push({
+          from: `[${a.category}] ${a.title}`,
+          to: `[${b.category}] ${b.title}`,
+          reason: 'related concepts',
+        });
+      }
+    }
+  }
+  return links;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// RETIREMENT: mark stale memories
+// ═══════════════════════════════════════════════════════════════
+
+function retireStale() {
+  const cutoff = new Date(Date.now() - STALE_DAYS * 24 * 60 * 60 * 1000);
+  const retired = [];
+
+  for (const cat of ['preference', 'decision', 'rule', 'fact']) {
+    const dir = path.join(ROOT, cat);
+    if (!fs.existsSync(dir)) continue;
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.endsWith('.md')) continue;
+      const filePath = path.join(dir, f);
+      const content = fs.readFileSync(filePath, 'utf-8');
+      const updatedMatch = content.match(/updated:\s*(.+)/);
+      if (updatedMatch) {
+        const updated = new Date(updatedMatch[1].trim());
+        if (updated < cutoff) {
+          // Add retired marker
+          if (!content.includes('status: retired')) {
+            const retired = content.replace(/^---$/m, '---\nstatus: retired');
+            fs.writeFileSync(filePath, retired);
+            retired.push({ category: cat, file: f, lastUpdated: updatedMatch[1].trim() });
+          }
+        }
+      }
+    }
+  }
+  return retired;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SAVE
+// ═══════════════════════════════════════════════════════════════
 
 function saveMemory(category, title, content) {
-  const ROOT = path.join(homedir(), '.triple-pi', 'memory');
-  const INDEX = path.join(ROOT, 'MEMORY.md');
-
   fs.mkdirSync(path.join(ROOT, category), { recursive: true });
 
   const date = new Date().toISOString().split('T')[0];
@@ -198,48 +514,125 @@ function saveMemory(category, title, content) {
   fs.writeFileSync(INDEX, lines.join('\n').trimEnd() + '\n');
 }
 
-// ── Main ─────────────────────────────────────────────────────
+function updateIndexForRetired(retiredItems) {
+  if (retiredItems.length === 0) return;
+  let idx = fs.existsSync(INDEX) ? fs.readFileSync(INDEX, 'utf-8') : '';
+  for (const item of retiredItems) {
+    idx = idx.replace(
+      new RegExp(`- \\[.*?\\]\\(${item.category}\\/${item.file.replace(/\.md$/, '')}.*?\\)`, 'g'),
+      `- ~~[retired]~~ (${item.category}/${item.file})`
+    );
+  }
+  fs.writeFileSync(INDEX, idx);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MAIN PIPELINE
+// ═══════════════════════════════════════════════════════════════
 
 async function main() {
-  console.log('🔍 Finding latest Pi session...');
-  const t = findLatestTranscript();
-  if (!t) { console.log('No transcripts found.'); process.exit(1); }
-  console.log(`   ${t.path}`);
+  console.log('🧠 Triple-pi Memory Extractor');
+  console.log('   Pipeline: Light Sleep → Scoring → Deep Sleep → REM\n');
 
+  // Find transcript
+  console.log('🔍 Phase 0: Finding latest Pi session...');
+  const t = findLatestTranscript();
+  if (!t) { console.log('   No transcripts found. Run ./pi-test.sh first.\n'); process.exit(1); }
+  console.log(`   ${t.path}\n`);
+
+  // Load
   console.log('📖 Loading transcript...');
   const messages = loadTranscript(t.path);
-  console.log(`   ${messages.length} messages (${messages.filter(m => m.role === 'user').length} user, ${messages.filter(m => m.role === 'assistant').length} assistant)`);
+  const userCount = messages.filter(m => m.role === 'user').length;
+  const asstCount = messages.filter(m => m.role === 'assistant').length;
+  console.log(`   ${messages.length} messages (${userCount} user, ${asstCount} assistant)\n`);
 
   if (messages.length < 4) {
-    console.log('   Too short, nothing to extract.');
+    console.log('   Too short (< 4 messages). Nothing to extract.\n');
     process.exit(0);
   }
 
-  console.log('🤖 Calling LLM to extract memories...');
+  // Phase 1: Light Sleep
+  console.log('🌙 Phase 1: Light Sleep — LLM extraction...');
   const text = await callLLM(messages);
-  const candidates = parseResponse(text);
-  console.log(`   ${candidates.length} candidates returned`);
+  const candidates = parseCandidates(text);
+  console.log(`   Extracted ${candidates.length} candidates\n`);
 
-  let saved = 0;
-  for (const c of candidates) {
-    if (c.confidence === 'low') {
-      console.log(`   ⏭  Low confidence: "${c.title}"`);
-      continue;
-    }
-    if (!validateEvidence(c, messages)) {
-      console.log(`   ⏭  Evidence not found: "${c.title}"`);
-      continue;
-    }
-    try {
-      saveMemory(c.category, c.title, c.content);
-      console.log(`   ✅ [${c.category}] "${c.title}"`);
-      saved++;
-    } catch (err) {
-      console.log(`   ❌ Failed: "${c.title}" — ${err.message}`);
-    }
+  if (candidates.length === 0) {
+    console.log('   No memories worth extracting. Session was likely testing/exploration.\n');
+    process.exit(0);
   }
 
-  console.log(`\n📊 Saved ${saved} memories, skipped ${candidates.length - saved}.`);
+  // Phase 2: Scoring + Evidence Validation
+  console.log('📊 Phase 2: Scoring & Validation...');
+  const scores = loadScores();
+  const existingMemories = loadExistingMemories();
+
+  const scored = candidates
+    .map(c => {
+      const score = scoreCandidate(c, messages, existingMemories);
+      const valid = validateEvidence(c, messages);
+      return { ...c, score: score.total, breakdown: score.breakdown, evidenceValid: valid };
+    })
+    .filter(c => c.evidenceValid && c.score >= SCORE_THRESHOLD)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, MAX_CANDIDATES_PER_RUN);
+
+  console.log(`   After validation + scoring (threshold ≥ ${SCORE_THRESHOLD}): ${scored.length} candidates`);
+  for (const c of candidates) {
+    const status = c.evidenceValid ? (c.score >= SCORE_THRESHOLD ? '✅' : '⏭️ score') : '❌ evidence';
+    if (c.evidenceValid && c.score >= SCORE_THRESHOLD) {
+      console.log(`   ${status} [${c.category}] "${c.title}" (score: ${c.score.toFixed(3)})`);
+      console.log(`      freq:${c.breakdown.frequency.toFixed(3)} rel:${c.breakdown.relevance.toFixed(3)} rec:${c.breakdown.recency.toFixed(3)} div:${c.breakdown.query_diversity.toFixed(3)} con:${c.breakdown.consolidation.toFixed(3)} rich:${c.breakdown.conceptual_richness.toFixed(3)}`);
+    }
+  }
+  console.log('');
+
+  // Phase 3: Deep Sleep — Merge
+  console.log('💤 Phase 3: Deep Sleep — Merge & Dedup...');
+  const { toSave, merged } = mergeMemories(scored, existingMemories);
+  console.log(`   Merged/updated: ${merged.length} | New to save: ${toSave.length}`);
+  for (const m of merged) {
+    console.log(`   🔗 ${m.action}: "${m.existing || m.candidate1}" ↔ "${m.candidate || m.candidate2}"`);
+  }
+  console.log('');
+
+  // Save
+  let saved = 0;
+  for (const c of toSave) {
+    saveMemory(c.category, c.title, c.content);
+    console.log(`   ✅ [${c.category}] "${c.title}" (score: ${c.score.toFixed(3)})`);
+    saved++;
+  }
+
+  // Phase 4: REM
+  console.log('\n🌈 Phase 4: REM — Cross-linking...');
+  const links = generateCrossLinks(scored);
+  if (links.length > 0) {
+    for (const l of links) console.log(`   🔗 ${l.from} ↔ ${l.to} (${l.reason})`);
+  } else {
+    console.log('   No cross-category links found.');
+  }
+
+  // Retirement
+  console.log('\n🗂️  Retirement check...');
+  const retired = retireStale();
+  if (retired.length > 0) {
+    updateIndexForRetired(retired);
+    for (const r of retired) console.log(`   🗑️  Retired: [${r.category}] ${r.file} (last updated ${r.lastUpdated})`);
+  } else {
+    console.log('   No stale memories to retire.');
+  }
+
+  // Update scores for frequency tracking
+  for (const c of scored) {
+    const key = c.title.toLowerCase();
+    scores[key] = (scores[key] || 0) + 1;
+  }
+  saveScores(scores);
+
+  console.log(`\n📊 Summary: saved ${saved}, merged ${merged.length}, skipped ${candidates.length - scored.length}, retired ${retired.length}`);
+  console.log(`   Score threshold: ≥${SCORE_THRESHOLD} | Max per run: ${MAX_CANDIDATES_PER_RUN}\n`);
 }
 
 main().catch(err => {

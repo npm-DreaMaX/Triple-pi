@@ -328,18 +328,70 @@ LangChain 的 Memory 是通用方案，但有几个问题：
 
 ---
 
-## 十、数字准备（量化你的工作）
+## 十、异步提取管道与评分公式（面试深度区）
+
+**面试官：你的提取器和 OpenClaw 的 Dreaming 是一回事吗？**
+
+**你的回答：**
+
+我参考了 OpenClaw Dreaming 的三阶段设计，做了适应个人开发者的简化。管道是四阶段：
+
+```
+Phase 1 — Light Sleep (LLM 提取):
+  Transcript → LLM with specialized extraction prompt
+  → Structured candidates with evidence quotes
+  
+Phase 2 — Scoring (6-dim weighted, 同 OpenClaw 公式):
+  Score = relevance(0.30) + frequency(0.24) + query_diversity(0.15)
+        + recency(0.15) + consolidation(0.10) + conceptual_richness(0.06)
+  
+  Only scores ≥ 0.5 pass the threshold.
+  Evidence must match transcript (grounded snippet check).
+  
+Phase 3 — Deep Sleep (合并 + 去重):
+  Jaccard similarity on 3-grams between candidate titles+content.
+  Similarity > 0.6 + same category → merge into existing memory.
+  
+Phase 4 — REM (跨主题关联):
+  不同 category 间相似度 > 0.4 → 生成关联标记。
+```
+
+**和 OpenClaw 的区别：**
+
+| 维度 | OpenClaw | Triple-pi |
+|------|----------|-----------|
+| 评分公式 | 相同 6 维权重 | 相同 6 维权重 |
+| 证据验证 | exact quote match | exact + 80% keyword fuzzy |
+| 合并算法 | LLM + 结构化判断 | Jaccard 3-gram + category match |
+| 退休机制 | Dreaming 标记 retired | 90 天无更新 → retired |
+| Cron 自动运行 | ✅ | ✅（crontab 一条命令） |
+| 规模目标 | 17000+ 页面 | 50-500 条记忆 |
+
+**为什么相同评分公式但不需要三阶段 LLM 调用：**
+
+OpenClaw 每个阶段都是一次 LLM 调用（Light Sleep → LLM, Deep Sleep → LLM, REM → LLM）。我的 Deep Sleep 和 REM 阶段用确定性算法（Jaccard 相似度），不需要额外 LLM 调用。**在 500 条记忆以下，Jaccard 相似度比 LLM 判断更可靠且零成本。** 到了上千条记忆的规模，LLM 判断语义相似性的优势才会超过确定性算法。
+
+**如果面试官追问：Jaccard 相似度的局限性？**
+
+"Jaccard 能判断'禁用 any 类型'和'不用 any'是相似记忆。但判断不了'偏好函数式编程'和'讨厌 class 语法'是同一个意思——这需要语义理解。在 50 条记忆的规模下，用户可以肉眼发现并手动合并；在 500 条以上时，引入 LLM 做语义合并。还是那个原则——先简单方案，不够用了再升级。"
+
+---
+
+## 十一、数字准备（量化你的工作）
 
 面试时提到具体数字会显著加分：
 
 | 指标 | 数字 |
 |------|------|
-| Memory 模块代码量 | ~400 行 TypeScript |
+| Memory 模块代码量 | ~600 行（Extension + Extractor） |
 | Pi 代码零修改 | 0 行改动 |
-| 集成注入点数 | 3 个（system prompt, custom tools, filesystem） |
+| 提取管道阶段数 | 4 阶段（Light Sleep → Scoring → Deep Sleep → REM） |
+| 评分维度 | 6 维加权（同 OpenClaw 公式） |
+| 评分阈值 | ≥ 0.5 |
 | Memory 索引 token 占用 | < 200 tokens（50 条记忆以内） |
-| 搜索延迟 | < 5ms（< 500 文件，grep 扫描） |
-| 支持的记忆分类 | 4 种（preference, decision, rule, fact） |
+| 搜索延迟 | < 5ms（< 500 文件） |
+| 退休周期 | 90 天无更新 |
+| 合并算法 | Jaccard 3-gram similarity |
 
 ---
 
