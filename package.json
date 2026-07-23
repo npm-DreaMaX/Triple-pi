@@ -9,6 +9,7 @@
     "extract": "node scripts/extract.mjs",
     "cron:install": "node scripts/install-cron.mjs",
     "cron:remove": "node scripts/remove-cron.mjs",
-    "setup": "cd pi-runtime && npm install --ignore-scripts && npm run build && cd .. && npm run install-ext && npm run cron:install"
+    "setup": "cd pi-runtime && npm install --ignore-scripts && npm run build && cd .. && npm run install-ext && npm run cron:install",
+    "eval": "node eval/runner.mjs"
   }
 }
