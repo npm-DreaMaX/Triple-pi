@@ -16,7 +16,7 @@ Triple-pi/
 │   ├── install-cron.mjs           ← 自动安装每日提取 cron
 │   └── remove-cron.mjs            ← 移除 cron
 ├── pi-runtime/                    ← Pi 源码（git submodule，只读）
-├── INTERVIEW.md                   ← 面试答辩手册（15 版本迭代 + 7 个 trade-off）
+├── INTERVIEW_MEMORY.md            ← Memory 模块面试答辩手册
 ├── package.json
 └── README.md
 ```
@@ -106,7 +106,7 @@ Phase 4 (REM)            → 跨主题关联（> 500 条记忆后启用）
 | 30 天休眠删除 | 个人项目周期短，废弃自动清理 |
 | Pi Extension 不改源码 | Pi 升级不受影响 |
 
-详见 [INTERVIEW.md](./INTERVIEW.md) — 完整 15 版本迭代记录、设计决策、面试答辩话术。
+详见 [INTERVIEW_MEMORY.md](./INTERVIEW_MEMORY.md) — Memory 模块设计决策、15 版本迭代、面试答辩。
 
 ## License
 
