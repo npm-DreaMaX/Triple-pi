@@ -34,10 +34,23 @@ import { homedir } from 'node:os';
 // CONFIG
 // ═══════════════════════════════════════════════════════════════
 
-const API_KEY = process.env.DEEPSEEK_API_KEY || process.env.ANTHROPIC_API_KEY || '';
-const IS_ANTHROPIC = !!process.env.ANTHROPIC_API_KEY && !process.env.DEEPSEEK_API_KEY;
+// Read API key from env or Pi's auth.json
+let API_KEY = process.env.DEEPSEEK_API_KEY || process.env.ANTHROPIC_API_KEY || '';
+let IS_ANTHROPIC = !!process.env.ANTHROPIC_API_KEY && !process.env.DEEPSEEK_API_KEY;
 
-const SCORE_THRESHOLD = 0.5;           // minimum score to save
+if (!API_KEY) {
+  try {
+    const authPath = path.join(homedir(), '.pi', 'agent', 'auth.json');
+    if (fs.existsSync(authPath)) {
+      const auth = JSON.parse(fs.readFileSync(authPath, 'utf-8'));
+      if (auth.deepseek?.key) { API_KEY = auth.deepseek.key; IS_ANTHROPIC = false; }
+      else if (auth.anthropic?.key) { API_KEY = auth.anthropic.key; IS_ANTHROPIC = true; }
+      else if (auth.openai?.key) { API_KEY = auth.openai.key; IS_ANTHROPIC = false; }
+    }
+  } catch {}
+}
+
+const SCORE_THRESHOLD = 0.35;          // minimum score to save (lower for personal-scale agent)
 const STALE_DAYS = 90;                 // memories not updated in 90 days → retired
 const MAX_CANDIDATES_PER_RUN = 15;     // cap extraction to avoid flooding
 
@@ -265,7 +278,7 @@ function scoreCandidate(candidate, messages, existingMemories) {
     const matches = allText.split(kw).length - 1;
     return sum + matches;
   }, 0) / Math.max(1, keywords.length);
-  const freqScore = Math.min(1, mentions / 5) * 0.24;  // cap at 5 mentions
+  const freqScore = Math.min(1, mentions / 3) * 0.24;  // cap at 3 mentions (personal scale)
 
   // ── Relevance (0.30): is this about tech/code/work or casual chat? ──
   const techTerms = ['typescript', 'javascript', 'python', 'api', 'auth', 'token',
@@ -339,7 +352,7 @@ function validateEvidence(candidate, messages) {
   const words = evidence.split(/\s+/).filter(w => w.length > 3);
   if (words.length === 0) return false;
   const matched = words.filter(w => fullText.toLowerCase().includes(w.toLowerCase()));
-  return matched.length / words.length >= 0.8;
+  return matched.length / words.length >= 0.7;  // 70% fuzzy match (personal agent, shorter transcripts)
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -534,9 +547,12 @@ async function main() {
   console.log('🧠 Triple-pi Memory Extractor');
   console.log('   Pipeline: Light Sleep → Scoring → Deep Sleep → REM\n');
 
+  // Accept transcript path as CLI argument
+  const cliPath = process.argv[2];
+
   // Find transcript
   console.log('🔍 Phase 0: Finding latest Pi session...');
-  const t = findLatestTranscript();
+  const t = cliPath ? { path: cliPath } : findLatestTranscript();
   if (!t) { console.log('   No transcripts found. Run ./pi-test.sh first.\n'); process.exit(1); }
   console.log(`   ${t.path}\n`);
 
@@ -573,24 +589,36 @@ async function main() {
       const score = scoreCandidate(c, messages, existingMemories);
       const valid = validateEvidence(c, messages);
       return { ...c, score: score.total, breakdown: score.breakdown, evidenceValid: valid };
-    })
+    });
+
+  // Show ALL candidates with their status
+  console.log(`   All ${scored.length} candidates:`);
+  for (const c of scored) {
+    const icon = c.evidenceValid ? (c.score >= SCORE_THRESHOLD ? '✅' : '📉') : '❌';
+    const reason = !c.evidenceValid ? 'evidence not in transcript'
+      : c.score < SCORE_THRESHOLD ? `score ${c.score.toFixed(3)} < ${SCORE_THRESHOLD}`
+      : 'PASSED';
+    console.log(`   ${icon} [${c.category}] "${c.title}"`);
+    console.log(`      ${reason} | freq:${c.breakdown.frequency.toFixed(2)} rel:${c.breakdown.relevance.toFixed(2)} rec:${c.breakdown.recency.toFixed(2)} div:${c.breakdown.query_diversity.toFixed(2)} con:${c.breakdown.consolidation.toFixed(2)} rich:${c.breakdown.conceptual_richness.toFixed(2)}`);
+  }
+
+  const filtered = scored
     .filter(c => c.evidenceValid && c.score >= SCORE_THRESHOLD)
     .sort((a, b) => b.score - a.score)
     .slice(0, MAX_CANDIDATES_PER_RUN);
 
-  console.log(`   After validation + scoring (threshold ≥ ${SCORE_THRESHOLD}): ${scored.length} candidates`);
-  for (const c of candidates) {
-    const status = c.evidenceValid ? (c.score >= SCORE_THRESHOLD ? '✅' : '⏭️ score') : '❌ evidence';
-    if (c.evidenceValid && c.score >= SCORE_THRESHOLD) {
-      console.log(`   ${status} [${c.category}] "${c.title}" (score: ${c.score.toFixed(3)})`);
-      console.log(`      freq:${c.breakdown.frequency.toFixed(3)} rel:${c.breakdown.relevance.toFixed(3)} rec:${c.breakdown.recency.toFixed(3)} div:${c.breakdown.query_diversity.toFixed(3)} con:${c.breakdown.consolidation.toFixed(3)} rich:${c.breakdown.conceptual_richness.toFixed(3)}`);
-    }
+  console.log(`\n   After filtering (evidence ✓ + score ≥ ${SCORE_THRESHOLD}): ${filtered.length} candidates\n`);
+
+  if (filtered.length === 0) {
+    scored.sort((a, b) => b.score - a.score);
+    const best = scored[0];
+    if (best) console.log(`   Best candidate: "${best.title}" (score ${best.score.toFixed(3)}, evidence: ${best.evidenceValid})\n`);
+    process.exit(0);
   }
-  console.log('');
 
   // Phase 3: Deep Sleep — Merge
   console.log('💤 Phase 3: Deep Sleep — Merge & Dedup...');
-  const { toSave, merged } = mergeMemories(scored, existingMemories);
+  const { toSave, merged } = mergeMemories(filtered, existingMemories);
   console.log(`   Merged/updated: ${merged.length} | New to save: ${toSave.length}`);
   for (const m of merged) {
     console.log(`   🔗 ${m.action}: "${m.existing || m.candidate1}" ↔ "${m.candidate || m.candidate2}"`);
