@@ -163,8 +163,15 @@ Categories:
 
 4. **rule** — Constraints the agent must follow. Must be explicitly stated.
 
-5. **fact** — Context NOT discoverable from project files. Skip anything the
-   agent could find by reading package.json, tsconfig, or source code.
+5. **fact** — Context that is NOT discoverable from ANY file the agent can read.
+   The critical test: "Can the agent find this by reading a file?"
+   - "项目要为 10 万并发用户设计" → fact (not in any file)
+   - "后端团队 3 个月后要重写这个模块" → fact (not in code)
+   - "这个微服务是订单系统的一部分，上游是用户服务" → fact (architecture context)
+   - ❌ "项目用 TypeScript" → tsconfig.json exists
+   - ❌ "测试框架是 vitest" → package.json exists
+   - ❌ "Pi 的 agentLoop 导出路径是 X" → source code exists
+   - ❌ ANYTHING the agent can discover by reading source code or config files
 
 ## What to SKIP
 
