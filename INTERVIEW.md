@@ -392,7 +392,7 @@ OpenClaw 每个阶段都是一次 LLM 调用（Light Sleep → LLM, Deep Sleep �
 | 评分阈值 | ≥ 0.5 |
 | Memory 索引 token 占用 | < 200 tokens（50 条记忆以内） |
 | 搜索延迟 | < 5ms（< 500 文件） |
-| 退休周期 | 30 天无更新（个人开发者项目周期短，90 天太长） |
+| 退休策略 | 无自动退休（项目隔离已解决污染，固定时间窗口判断不了长期项目 vs 一次性项目） |
 | 合并算法 | Jaccard 3-gram similarity |
 
 ---

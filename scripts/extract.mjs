@@ -51,7 +51,12 @@ if (!API_KEY) {
 }
 
 const SCORE_THRESHOLD = 0.35;          // minimum score to save (lower for personal-scale agent)
-const STALE_DAYS = 30;                 // personal dev cycle: retire after 30 days inactivity
+// Retirement: disabled for personal agent.
+// Project scoping already prevents context pollution — memories from
+// other projects are never injected. Fixed timeouts can't distinguish
+// "abandoned project" from "maintained project with gaps".
+// If manual cleanup is ever needed: delete files from the project dir.
+const STALE_DAYS = Infinity;           // no auto-retirement
 const MAX_CANDIDATES_PER_RUN = 15;     // cap extraction to avoid flooding
 
 const ROOT = path.join(homedir(), '.triple-pi', 'memory');
