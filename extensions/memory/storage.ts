@@ -74,24 +74,29 @@ export function getProjectSlug(cwd?: string): string {
   if (_cachedProjectSlug) return _cachedProjectSlug;
 
   const dir = cwd || process.cwd();
+  // Prefer git remote URL (stable across renames), fall back to workspace path.
+  // OpenClaw principle: workspace path is the canonical identity for memory scoping.
+  // We NEVER generate a random fallback — that would merge unrelated projects.
   try {
-    // Best: use git remote origin URL (stable across machines and renames)
     const remote = execSync('git remote get-url origin', { cwd: dir, stdio: 'pipe', timeout: 5000 })
       .toString().trim();
-    // Normalize: remove protocol, .git suffix, special chars
     _cachedProjectSlug = remote
       .replace(/^https?:\/\//, '')
       .replace(/\.git$/, '')
       .replace(/[^a-zA-Z0-9-_.]/g, '-')
       .replace(/-+/g, '-')
       .slice(0, 64);
-    return _cachedProjectSlug;
   } catch {
-    // Fallback: hash the absolute path
-    const hash = dir.split('').reduce((h, c) => ((h << 5) - h + c.charCodeAt(0)) | 0, 0);
-    _cachedProjectSlug = `local-${Math.abs(hash).toString(36)}`;
-    return _cachedProjectSlug;
+    // No git remote: use resolved absolute path as workspace identity
+    const resolved = path.resolve(dir);
+    _cachedProjectSlug = resolved
+      .replace(/^\//, '')          // strip leading /
+      .replace(/\//g, '-')         // path separators → dashes
+      .replace(/[^a-zA-Z0-9-_.]/g, '-')
+      .replace(/-+/g, '-')
+      .slice(0, 80);
   }
+  return _cachedProjectSlug;
 }
 
 // ═══════════════════════════════════════════════════════════════
