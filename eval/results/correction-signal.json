@@ -4,7 +4,7 @@
     {
       "category": "decision",
       "title": "Use JWT instead of session for auth",
-      "score": 0.609
+      "score": 0.61
     },
     {
       "category": "rule",
@@ -17,5 +17,5 @@
       "score": 0.415
     }
   ],
-  "timestamp": "2026-07-23T13:49:08.822Z"
+  "timestamp": "2026-07-23T13:57:37.963Z"
 }

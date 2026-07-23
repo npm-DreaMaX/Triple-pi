@@ -1,0 +1,5 @@
+{"type":"message","message":{"role":"user","content":[{"type":"text","text":"这是项目 B——React 后台管理系统。用 Vite + React 18 + Ant Design。状态管理用 zustand，别用 Redux。"}]},"timestamp":"2026-07-24T16:00:00Z"}
+{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"好的。Vite + React 18 + Ant Design。zustand 做状态管理，不用 Redux。"}]},"timestamp":"2026-07-24T16:00:05Z"}
+{"type":"message","message":{"role":"user","content":[{"type":"text","text":"组件用函数式写法，所有组件加 PropTypes 或者直接用 TypeScript 的类型。"}]},"timestamp":"2026-07-24T16:01:00Z"}
+{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"明白。函数式组件 + 类型标注。"}]},"timestamp":"2026-07-24T16:01:05Z"}
+{"type":"message","message":{"role":"user","content":[{"type":"text","text":"样式用 CSS Modules 不要用 styled-components。项目里已经配好了。"}]},"timestamp":"2026-07-24T16:02:00Z"}

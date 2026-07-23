@@ -1,0 +1,4 @@
+{"type":"message","message":{"role":"user","content":[{"type":"text","text":"hi"}]},"timestamp":"2026-07-24T17:00:00Z"}
+{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"你好，有什么可以帮你的？"}]},"timestamp":"2026-07-24T17:00:05Z"}
+{"type":"message","message":{"role":"user","content":[{"type":"text","text":"没事，就是测试一下"}]},"timestamp":"2026-07-24T17:00:30Z"}
+{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"好的，有需要随时找我"}]},"timestamp":"2026-07-24T17:00:35Z"}

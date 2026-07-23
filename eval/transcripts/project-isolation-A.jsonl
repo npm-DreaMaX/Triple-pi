@@ -1,0 +1,6 @@
+{"type":"message","message":{"role":"user","content":[{"type":"text","text":"这是项目 A——电商后端。数据库用 PostgreSQL，Redis 做缓存。记住：所有金额计算用整数（分），不用浮点。"}]},"timestamp":"2026-07-24T15:00:00Z"}
+{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"好的。PostgreSQL + Redis。金额用分做单位，不用浮点。这是重要规则，我记住了。"}]},"timestamp":"2026-07-24T15:00:05Z"}
+{"type":"message","message":{"role":"user","content":[{"type":"text","text":"还有一个偏好：数据库 migration 用 goose 不用 knex。之前 knex 踩过坑。"}]},"timestamp":"2026-07-24T15:01:00Z"}
+{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"明白，goose 做 migration。记住这个偏好了。"}]},"timestamp":"2026-07-24T15:01:05Z"}
+{"type":"message","message":{"role":"user","content":[{"type":"text","text":"对了，这个项目禁止用 ORM——所有 SQL 手写。性能要求高，ORM 生成的 SQL 不够优化。"}]},"timestamp":"2026-07-24T15:02:00Z"}
+{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"了解。禁止 ORM，手写 SQL。这是项目规则。"}]},"timestamp":"2026-07-24T15:02:05Z"}
