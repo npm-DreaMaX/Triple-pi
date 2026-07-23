@@ -658,15 +658,28 @@ OpenClaw 的解决方案完全不同——它不让 Agent 在对话中实时决�
 
 ### 核心 Trade-off 总结
 
-| 选择 | 为什么 | 代价 |
-|------|------|------|
-| 异步提取而非实时写入 | LLM 实时调用会过度写入垃圾记忆 | 需要手动或 cron 运行 extract |
-| 文件存储而非数据库 | 人类可编辑、Git 跟踪、零依赖 | 搜索是 grep，不是语义搜索 |
-| 6 维评分而非纯 LLM 判断 | 规模小时确定性算法更快更便宜 | 无法判断"可发现性"和"有用性" |
-| 加 Deep Sleep 二次审核 | 补评分公式的盲区 | 每次提取多 1 次 LLM 调用 |
-| 项目隔离而非全局池 | 解决 context 污染 | 跨项目通用偏好需要显式 global |
-| 30 天删除而非无限保留 | 个人项目周期短，废弃项目清理 | 间歇性维护项目可能被误删 |
-| Pi 不改一行代码 | 升级不受影响、边界清晰 | 只能通过 Pi 预留的 Extension 机制集成 |
+| 选择 | 为什么 | 对比 | 代价 |
+|------|------|------|------|
+| 异步提取而非实时写入 | LLM 实时调用会过度写入垃圾记忆 | OpenClaw: cron 凌晨 3 点，我们: npm run extract | 不实时，有延迟 |
+| 文件存储而非数据库 | 人类可编辑、Git 跟踪、零依赖 | OpenClaw GBrain: Postgres + pgvector | 搜索是 grep，不是语义搜索 |
+| 6 维评分 + Deep Sleep | 确定性评分快，LLM 审核准。各做各擅长的 | OpenClaw: 全部 LLM | 每提取多 1 次 LLM 调用 |
+| 项目隔离而非全局池 | 做 React 不加载 Pi 记忆 | OpenClaw: workspace 路径 + agent ID 多级隔离 | 跨项目偏好要显式 global |
+| 30 天删除 | 个人项目周期短，废弃自动清理 | OpenClaw: Dreaming 标记 retired | 间歇维护项目可能被误删 |
+| Extension 注入而非改源码 | Pi 升级不受影响 | — | 只能用 Pi 预留的钩子 |
+
+### 省了哪些成本（vs 如果全部照搬 OpenClaw）
+
+| 不需要 | 因为 | 省了什么 |
+|--------|------|---------|
+| Postgres + pgvector | 个人 Agent < 500 条记忆 | 零运维、零基础设施 |
+| 3 阶段 LLM Dreaming（Light/Deep/REM） | REM（跨主题关联）在 50 条记忆下无价值 | 每天少 1 次 LLM 调用 |
+| 多用户/多 Agent 隔离 | 单用户工具 | Session Router、per-channel 隔离全不用 |
+| Compiled Truth + Timeline 证据链 | 不需要审计追溯 | 存储复杂度大幅降低 |
+| 加权评分 + cron 自动化 | 个人规模不需要 24/7 运行 | 只在有会话的日子跑提取 |
+
+### 如果面试官问"你这和 OpenClaw 比差了什么"
+
+> "OpenClaw 是多用户 SaaS，我是个人工具。它需要 Postgres、多级隔离、三阶段 Dreaming、证据链审计——这些对我的场景都是过度设计。我选择性地借鉴了核心设计（索引+分文件、评分公式、Deep Sleep），舍弃了不适合个人规模的部分（pgvector、REM、多租户隔离）。知道什么该借鉴、什么该舍弃，比全盘照搬更能体现工程判断力。"
 
 ---
 

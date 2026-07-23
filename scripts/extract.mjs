@@ -734,12 +734,32 @@ function updateIndexForRetired(retiredItems) {
 // MAIN PIPELINE
 // ═══════════════════════════════════════════════════════════════
 
+// Check if there's a session from today (worth extracting)
+function hasSessionToday() {
+  const base = path.join(homedir(), '.pi', 'agent', 'sessions');
+  if (!fs.existsSync(base)) return false;
+  const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+  for (const dir of fs.readdirSync(base, { withFileTypes: true })) {
+    if (!dir.isDirectory()) continue;
+    for (const f of fs.readdirSync(path.join(base, dir.name))) {
+      if (f.endsWith('.jsonl') && f >= today) return true;
+    }
+  }
+  return false;
+}
+
 async function main() {
   console.log('🧠 Triple-pi Memory Extractor');
   console.log('   Pipeline: Light Sleep → Scoring → Deep Sleep → REM\n');
 
-  // Accept transcript path as CLI argument
+  // Accept transcript path as CLI argument (for manual testing)
   const cliPath = process.argv[2];
+
+  // If running automatically (no CLI arg), skip when no session today
+  if (!cliPath && !hasSessionToday()) {
+    console.log('⏭  No sessions today. Skipping extraction.\n');
+    process.exit(0);
+  }
 
   // Find transcript
   console.log('🔍 Phase 0: Finding latest Pi session...');
