@@ -125,7 +125,7 @@ Token 预算。索引（< 200 tokens）始终在 system prompt → Agent 知道�
 - rule → "禁止 git push"（约束）
 - fact → "项目三个月后迁移 Go"（不在代码里的上下文）
 
-**knowledge 的评分特殊处理：** 只说一次就够了，给满分 frequency score（0.24），不因低频被过滤。
+**frequency 跨会话累积：** 不只看单次对话里的出现次数，还加上 `.scores.json` 里的历史累积。同一个项目里多次提到的东西自然高频——不需要特殊照顾某类记忆。
 
 ### Q8：评分公式为什么是 6 维？
 

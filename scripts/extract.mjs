@@ -291,7 +291,7 @@ function saveScores(scores) {
  * Score = relevance(0.30) + frequency(0.24) + query_diversity(0.15)
  *       + recency(0.15) + consolidation(0.10) + conceptual_richness(0.06)
  */
-function scoreCandidate(candidate, messages, existingMemories) {
+function scoreCandidate(candidate, messages, existingMemories, scores) {
   const evidence = candidate.evidence.toLowerCase();
   const title = candidate.title.toLowerCase();
   const content = candidate.content.toLowerCase();
@@ -304,10 +304,12 @@ function scoreCandidate(candidate, messages, existingMemories) {
     const matches = allText.split(kw).length - 1;
     return sum + matches;
   }, 0) / Math.max(1, keywords.length);
-  const isKnowledge = candidate.category === 'knowledge';
-  const freqScore = isKnowledge
-    ? 0.24  // knowledge: full score (stated once is enough)
-    : Math.min(1, mentions / 3) * 0.24;
+  // Cross-session accumulated frequency: combine this session's mentions
+  // with historical counts from .scores.json. Same weight as OpenClaw.
+  const sessionMentions = Math.min(1, mentions / 3);
+  const historicalHits = scores[candidate.title.toLowerCase()] || 0;
+  const accumulated = Math.min(1, sessionMentions + historicalHits * 0.15);
+  const freqScore = accumulated * 0.24;
 
   // ── Relevance (0.30): is this about tech/code/work or casual chat? ──
   const techTerms = ['typescript', 'javascript', 'python', 'api', 'auth', 'token',
@@ -797,7 +799,7 @@ async function main() {
 
   const scored = candidates
     .map(c => {
-      const score = scoreCandidate(c, messages, existingMemories);
+      const score = scoreCandidate(c, messages, existingMemories, scores);
       const valid = validateEvidence(c, messages);
       return { ...c, score: score.total, breakdown: score.breakdown, evidenceValid: valid };
     });
