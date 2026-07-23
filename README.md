@@ -16,7 +16,8 @@ Triple-pi/
 │   ├── install-cron.mjs           ← 自动安装每日提取 cron
 │   └── remove-cron.mjs            ← 移除 cron
 ├── pi-runtime/                    ← Pi 源码（git submodule，只读）
-├── INTERVIEW_MEMORY.md            ← Memory 模块面试答辩手册
+├── INTERVIEW_MEMORY.md            ← Memory 模块面试答辩
+├── INTERVIEW_EVAL.md               ← Eval 模块面试答辩
 ├── package.json
 └── README.md
 ```
