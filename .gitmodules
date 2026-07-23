@@ -1,0 +1,3 @@
+[submodule "pi-runtime"]
+	path = pi-runtime
+	url = https://github.com/earendil-works/pi.git

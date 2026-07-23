@@ -1,0 +1,19 @@
+{
+  "name": "triple-pi",
+  "version": "0.1.0",
+  "description": "Personal Coding Agent with persistent memory — built on Pi Runtime",
+  "type": "module",
+  "private": true,
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/main.js",
+    "dev": "tsc && node dist/main.js",
+    "setup": "cd pi-runtime && npm install --ignore-scripts && npm run build && cd .. && npm install && npm run build"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "file:./pi-runtime/packages/coding-agent",
+    "@earendil-works/pi-agent-core": "file:./pi-runtime/packages/agent",
+    "@earendil-works/pi-ai": "file:./pi-runtime/packages/ai"
+  }
+}
