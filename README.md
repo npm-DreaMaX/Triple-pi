@@ -1,82 +1,112 @@
 # Triple-pi
 
-基于 [Pi Agent Runtime](https://github.com/earendil-works/pi) 的个人 Coding Agent，增加了跨会话持久化记忆。
+基于 [Pi Agent Runtime](https://github.com/earendil-works/pi) 的个人 Coding Agent，增加 OpenClaw 风格的跨会话持久化记忆。
+
+**不改 Pi 一行源码。** 通过 Pi Extension 机制集成。
 
 ## 项目结构
 
 ```
 Triple-pi/
-├── pi-runtime/                  ← Pi 源码（git submodule，不改）
-├── src/
-│   ├── memory/
-│   │   ├── types.ts             ← 类型定义 + 分类指南
-│   │   └── index.ts             ← 核心：CRUD / 搜索 / 去重 / system prompt
-│   ├── tools/
-│   │   ├── save-memory.ts       ← Pi 工具：写入记忆
-│   │   └── search-memory.ts     ← Pi 工具：检索记忆
-│   └── main.ts                  ← 入口：组装 + 启动
-├── INTERVIEW.md                 ← 面试答辩手册（设计决策 + 问答话术）
+├── extensions/memory/             ← Pi Extension（Pi TUI 自动加载）
+│   ├── index.ts                   ← SaveMemory + SearchMemory 工具
+│   └── storage.ts                 ← 项目隔离存储 + 休眠跟踪
+├── scripts/
+│   ├── extract.mjs                ← 5 阶段异步提取管道
+│   ├── install-cron.mjs           ← 自动安装每日提取 cron
+│   └── remove-cron.mjs            ← 移除 cron
+├── pi-runtime/                    ← Pi 源码（git submodule，只读）
+├── INTERVIEW.md                   ← 面试答辩手册（15 版本迭代 + 7 个 trade-off）
 ├── package.json
-├── tsconfig.json
 └── README.md
 ```
 
 ## 快速开始
 
 ```bash
-# 1. 克隆（必须带 --recurse-submodules，否则 pi-runtime 是空的）
 git clone --recurse-submodules https://github.com/npm-DreaMaX/Triple-pi.git
 cd Triple-pi
+npm run setup    # 构建 Pi + 安装 Extension + 设置每日自动提取 cron
+```
 
-# 2. 一键安装：构建 Pi + 安装 Extension + 设置每日自动提取
-npm run setup
+配置 API Key（选一种）：
 
-# 3. 配置 LLM API Key
-# 方式 A：环境变量
+```bash
+# 环境变量
 export DEEPSEEK_API_KEY=sk-xxx
 
-# 方式 B：Pi 内置 /login 命令
-cd pi-runtime && ./pi-test.sh  # 进入后输入 /login
-
-# 4. 启动
-cd pi-runtime && ./pi-test.sh
-# 或通过 Triple-pi Extension 提供的 Memory 工具对话
-
-# 每天凌晨 3 点自动提取记忆（setup 已安装 cron，无需手动操作）
+# 或 Pi 内置登录
+cd pi-runtime && ./pi-test.sh   # 进入后输入 /login
 ```
+
+启动：
+
+```bash
+cd pi-runtime && ./pi-test.sh
+```
+
+**每天凌晨 3 点自动提取记忆**（`npm run setup` 已安装 cron，无需手动操作）。手动提取：`npm run extract`。
 
 ## 与 Pi 的关系
 
-Pi 提供 Agent Loop、LLM 抽象、工具系统。Triple-pi 在此基础上增加持久化记忆层。
-
-| 层 | 提供方 | Triple-pi 是否修改 |
-|----|--------|-------------------|
-| Agent Loop (双层 while 循环) | Pi Runtime | ❌ |
-| LLM 抽象 (多 Provider) | Pi AI | ❌ |
-| 工具系统 (Read/Write/Edit/Bash/Grep) | Pi Coding Agent | ❌ |
+| 层 | 提供方 | 修改？ |
+|----|--------|--------|
+| Agent Loop | Pi Runtime | ❌ |
+| LLM 多 Provider | Pi AI | ❌ |
+| 工具系统 | Pi Coding Agent | ❌ |
 | Session 管理 + Compaction | Pi Coding Agent | ❌ |
-| 持久化记忆 (跨 Session) | **Triple-pi** | ✅ |
-| Memory 工具 (SaveMemory/SearchMemory) | **Triple-pi** | ✅ |
+| 持久化记忆层 | **Triple-pi** | ✅ |
+| Memory 提取管道 | **Triple-pi** | ✅ |
 
-## Memory 设计
+## Memory 架构
 
-借鉴 OpenClaw 的索引 + 分文件模式：
+借鉴 OpenClaw 的 Dreaming 系统，适应个人开发者规模。
 
-- `~/.triple-pi/memory/MEMORY.md` — 索引（< 200 tokens），始终在 system prompt
-- `~/.triple-pi/memory/{preference,decision,rule,fact}/` — 具体记忆，按需读取
+### 提取管道（5 阶段）
 
-四个分类：preference（偏好）、decision（决策）、rule（规则）、fact（事实）
+```
+Phase 1 (Light Sleep)    → LLM 扫描 transcript，提取候选 + 证据引用
+Phase 2 (Scoring)        → 6 维加权评分（同 OpenClaw 权重）
+Phase 2.5 (Deep Sleep)   → 二次 LLM 审核：去噪、合并相似、过滤可发现信息
+Phase 3 (Merge)          → Jaccard 确定性去重
+Phase 4 (REM)            → 跨主题关联（> 500 条记忆后启用）
 
-**为什么不是全量注入？**
-- Token 预算。一年积累 500 条记忆 → 全量注入浪费 token 且稀释关键信息
-- 索引告诉 Agent 它知道什么；需要时再读具体内容
+30 天不活跃的项目 → 记忆自动删除
+```
 
-**为什么不用数据库？**
-- 人类可读可编辑（vim 直接改）
-- Git 可追踪
-- 零依赖（个人 Agent，< 500 条记忆不需要数据库）
+### 存储结构
 
-详见 [INTERVIEW.md](./INTERVIEW.md)
+```
+~/.triple-pi/memory/
+├── global/                            ← 跨项目（沟通风格、通用偏好）
+│   ├── MEMORY.md
+│   └── knowledge/ preference/ decision/ rule/ fact/
+├── github-com-xxx-project-a/          ← 项目 A（仅在 cd 到该项目时加载）
+└── home-user-projects-b/              ← 项目 B
+```
+
+### 5 种记忆类型
+
+| 类型 | 用途 | 示例 |
+|------|------|------|
+| **knowledge** | 用户知识水平 | "用户已读过 agent-loop.ts 源码" |
+| **preference** | 工作偏好 | "偏好简洁回复，代码注释用英文" |
+| **decision** | 技术决策及原因 | "选 JWT 而非 session，因为多服务无状态" |
+| **rule** | 行为约束 | "禁止 git push 到 main" |
+| **fact** | 不在代码中的上下文 | "项目三个月后迁移到 Go" |
+
+### 核心 Trade-off
+
+| 选择 | 为什么 |
+|------|------|
+| 异步提取而非实时写入 | LLM 实时调用会过度写入垃圾 |
+| 文件存储而非数据库 | 人类可编辑、Git 跟踪、零运维 |
+| 确定性评分 + Deep Sleep LLM 审核 | 各做各擅长的：评分快，审核准 |
+| 项目隔离而非全局池 | 做 React 时不加载 Pi 的记忆 |
+| 30 天休眠删除 | 个人项目周期短，废弃自动清理 |
+| Pi Extension 不改源码 | Pi 升级不受影响 |
+
+详见 [INTERVIEW.md](./INTERVIEW.md) — 完整 15 版本迭代记录、设计决策、面试答辩话术。
 
 ## License
 
