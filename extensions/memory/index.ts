@@ -15,7 +15,7 @@
 
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { save, search } from "./storage";
+import { save, search, loadContextPrompt } from "./storage";
 
 // ── SaveMemory ──────────────────────────────────────────────
 
@@ -40,16 +40,20 @@ const saveMemoryTool = defineTool({
   promptSnippet: "save important info to persistent memory (user must explicitly ask)",
   parameters: Type.Object({
     category: Type.String({
-      description: "记忆分类：preference=偏好, decision=决策, rule=规则, fact=事实",
+      description: "记忆分类：preference=偏好, decision=决策, rule=规则, fact=事实, knowledge=知识水平",
     }),
     title: Type.String({ description: "简短标题" }),
     content: Type.String({ description: "记忆内容（含原因和适用场景）" }),
+    scope: Type.Optional(Type.String({
+      description: "作用域：project=仅当前项目(默认), global=所有项目通用。用户偏好和沟通风格用 global，项目特定信息用 project",
+    })),
   }),
   async execute(_id, params, _signal, _onUpdate, _ctx) {
-    const { category, title, content } = params as {
+    const { category, title, content, scope } = params as {
       category: string;
       title: string;
       content: string;
+      scope?: string;
     };
     const valid = ["preference", "decision", "rule", "fact", "knowledge"];
     if (!valid.includes(category)) {
@@ -58,11 +62,12 @@ const saveMemoryTool = defineTool({
         details: {},
       };
     }
+    const scoped = scope === 'global' ? 'global' : 'project';
     try {
-      const fp = save(category as any, title, content);
+      const fp = save(category as any, title, content, scoped);
       return {
-        content: [{ type: "text", text: `✅ 已记住："${title}"\n文件：${fp}\n后续会话自动加载。` }],
-        details: { filepath: fp, category, title },
+        content: [{ type: "text", text: `✅ 已记住："${title}"\n作用域：${scoped}（${scoped === 'global' ? '所有项目可用' : '仅当前项目'}）\n文件：${fp}` }],
+        details: { filepath: fp, category, title, scope: scoped },
       };
     } catch (err: any) {
       return {
