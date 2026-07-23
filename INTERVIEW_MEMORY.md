@@ -228,6 +228,68 @@ sessionMentions（本次） + historicalHits（历史累积） × 0.15
 
 **休眠：** 30 天不活跃 → 删除项目记忆。为什么 30 天？个人项目周期短。为什么直接删不先问？简单规则换零维护成本。
 
+### Q11：记忆的时间粒度 —— 为什么需要 Daily Log + Scratchpad
+
+**调研 pi-mem 时发现：** 他们除了长期记忆（MEMORY.md），还有 `daily/YYYY-MM-DD.md`（每日摘要）和 `SCRATCHPAD.md`（当前在做的事）。这和 OpenClaw 的 daily memory + MEMORY.md 双层结构一样。
+
+**我们缺了什么：**
+
+```
+OpenClaw / pi-mem:              我们（加之前）:
+  MEMORY.md (长期记忆)      →   ✅
+  daily/YYYY-MM-DD.md       →   ❌ 没有
+  SCRATCHPAD.md             →   ❌ 没有
+```
+
+**为什么需要三层粒度：**
+
+| 层 | 时间跨度 | 内容 | 例子 |
+|----|---------|------|------|
+| Scratchpad | 几小时 | 当前在做的事、进行到哪了 | "正在重构 auth 模块，改到 token.ts 第 42 行" |
+| Daily Log | 1 天 | 今天做了什么 | "7/23：讨论了评分阈值，加了 Deep Sleep" |
+| Long-term | 永久 | 需要跨会话保留的知识 | "用户偏好 TypeScript strict 模式" |
+
+**为什么 Agent 能自己维护：** Daily Log 和 Scratchpad 就是两个 markdown 文件。Agent 本身有 Read/Write 工具——在 system prompt 里告诉它这两个文件的路径和用途，它就能自己读写。不需要 extractor，不需要 cron。
+
+**面试时怎么说：** > "调研 pi-mem 时我发现他们有三层时间粒度——scratchpad（小时级）、daily log（天级）、long-term memory（永久）。我只做了长期记忆，漏了前两层。加这两层不需要写新代码——Agent 本身有 Write 工具，只要在 system prompt 里告诉它这两个文件的存在和用途，它就能自己维护。这让我意识到记忆管理的核心不是技术复杂度，是给 Agent 正确的上下文指引。"
+
+### Q12：纠正信号权重 —— 不是所有对话同等重要
+
+**调研 pi-hermes-memory 时发现：** 他们做了 Failure Memory 和 Correction Detection——用户纠正 Agent 时立即保存，比普通对话优先级更高。
+
+**我们的问题：** extraction prompt 对所有对话一视同仁。用户随口说的和纠正 Agent 的，LLM 看到的权重一样。但实际上——用户说"不对，应该用 JWT 不是 session"比"今天写了 login 模块"重要得多。
+
+**解决：在 extraction prompt 里加信号权重，不是改代码：**
+
+```
+特别关注的信号：
+1. 纠正信号："不对"、"应该是"、"改成"、"不要用 X，用 Y"
+2. 失败信号："这个方案不行"、"试过了有问题"  
+3. 强偏好信号："我讨厌 X"、"以后都 Y"、"再也别 Z"
+4. 明确记忆请求："记住这个"、"别忘了"、"下次记得"
+```
+
+**为什么不是实时触发而是改 prompt：** pi-hermes-memory 是每 10 轮触发一次实时保存。我们是凌晨 3 点异步提取。但纠正信号的权重提升不需要实时——LLM 扫描 transcript 时看到"不对，应该用 JWT"，给它更高的 confidence 分数就行。**信号权重的价值在于"这条比别的更重要"，不在于"什么时候保存"。**
+
+**面试时怎么说：** > "pi-hermes-memory 的 correction detection 是实时触发，我觉得实时不是关键——晚上统一提取时，纠正信号依然比普通对话更应该被记住。我把信号权重加到了 extraction prompt 里。这不是技术问题，是提示工程——告诉 LLM 什么信号更值得关注。"
+
+### Q13：和已有的 Pi Memory 扩展相比，你的差异在哪
+
+**调研了 6 个已有的 Pi Memory 扩展（pi-hermes-memory、pi-mem、pi-memory-md、pi-memory、pi-memory-blocks、pi-memd）。** 大部分做了存储和检索，但没有做异步提取和质量审核。
+
+| 能力 | 已有的 6 个扩展 | Triple-pi |
+|------|---------------|-----------|
+| 存储 | ✅ 全部都有 | ✅ |
+| 检索 | ✅ 大部分有（FTS/向量/grep） | ✅ grep |
+| 项目隔离 | ⚠️ 部分有 | ✅ global + per-project |
+| 自动提取 | ❌ 只有 1 个做了规则触发 | ✅ 评分驱动 + 证据验证 |
+| 质量审核 | ❌ 没有 | ✅ Deep Sleep LLM |
+| 纠正信号 | ⚠️ pi-hermes-memory 有 | ✅ extraction prompt 加权 |
+| 时间粒度 | ⚠️ pi-mem 有 daily log | ✅ 三层（scratchpad/daily/long-term） |
+| cron 自动 | ❌ 没有 | ✅ npm run setup 自动安装 |
+
+**我们的差异化：** 大部分扩展关注"怎么存怎么搜"，我们关注"存什么、怎么判断该不该存、存的质量如何"。这是知识管理和文件管理的区别。
+
 ---
 
 ## 四、Trade-off：每个选择都有代价，我知道代价
@@ -274,6 +336,9 @@ sessionMentions（本次） + historicalHits（历史累积） × 0.15
 | v0.13 | 评分算不出质量 | **用户指出** | 加 Deep Sleep |
 | v0.14 | 无 session 也跑 | 逻辑审视 | 有 session 才跑 |
 | v0.15 | cron 需手动 | **用户指出** | npm run setup 自动化 |
+| v0.16 | knowledge hack 不对 | **用户指出**"凭什么一次满分" | frequency 跨会话累积 |
+| v0.17 | 缺 daily log + scratchpad | 调研 pi-mem | 三层时间粒度 |
+| v0.17 | 纠正信号被忽视 | 调研 pi-hermes-memory | extraction prompt 加权 |
 
 **面试官能从这张表看到：** 你会通过使用发现问题、会听反馈、会做减法、会调研。
 
@@ -324,11 +389,12 @@ Phase 2 评分合格但 evidence 验证全挂——LLM 返回的 evidence 是意
 | 指标 | 数字 |
 |------|------|
 | Extension 代码 | ~200 行 TS |
-| Extractor 代码 | ~550 行 JS |
+| Extractor 代码 | ~580 行 JS |
 | Pi 修改 | 0 行 |
 | 管道阶段 | 5（Light Sleep → Scoring → Deep Sleep → Merge → REM） |
-| 评分维度 | 6 维（同 OpenClaw 权重） |
+| 评分维度 | 6 维（同 OpenClaw 权重）+ 4 种信号权重 |
 | 记忆类型 | 5 种（knowledge/preference/decision/rule/fact） |
+| 时间粒度 | 3 层（scratchpad / daily log / long-term） |
 | 项目隔离 | global + per-project |
 | 休眠 | 30 天删除 |
 | LLM 调用/天 | 最多 2 次，约 0.02 元 |

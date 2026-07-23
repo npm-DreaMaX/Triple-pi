@@ -195,6 +195,16 @@ export function loadContextPrompt(cwd?: string): MemoryContext {
 
   prompt += '\nUse Read tool to load specific memory files, or SearchMemory to search by keyword.';
 
+  // Daily log + scratchpad paths
+  const projectDir = path.join(ROOT, project);
+  const dailyLog = path.join(projectDir, 'DAILY.md');
+  const scratchpad = path.join(projectDir, 'SCRATCHPAD.md');
+
+  prompt += `\n\n## Working State\n\n`;
+  prompt += `Daily log: ${dailyLog} — append a summary at the end of each session.\n`;
+  prompt += `Scratchpad: ${scratchpad} — track what you're currently working on.\n`;
+  prompt += `Keep these updated. They help you resume context quickly.\n`;
+
   return { prompt, count: globalEntries + projEntries, project };
 }
 

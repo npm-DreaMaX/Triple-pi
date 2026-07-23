@@ -142,6 +142,23 @@ Before extracting anything, ask: **"Will this information change how the agent s
 - ❌ "The CLI flag is --model not MODEL env var" → NO, one-time config trivia
 - ❌ "package name is @earendil-works/pi-agent" → NO, the agent can read package.json
 
+## Signal Weight — These matter MORE than ordinary statements
+
+When you see these signals in the transcript, the associated information is
+especially worth extracting (higher confidence, more weight):
+
+1. **Corrections** — User corrected the agent: "不对", "应该是", "改成", "不要用 X，用 Y"
+   → Save what was corrected AND the correct answer.
+
+2. **Failures** — Something was tried and didn't work: "这个方案不行", "试过了有问题"
+   → Save what failed and why. Prevents repeating mistakes.
+
+3. **Strong preferences** — User expressed clear like/dislike: "我讨厌 X", "以后都 Y", "再也别 Z"
+   → These are high-confidence preferences.
+
+4. **Explicit remember requests** — User said "记住这个", "别忘了", "下次记得"
+   → These are user-confirmed signals. Highest weight.
+
 ## What TO extract
 
 Only extract information that passes this test:
