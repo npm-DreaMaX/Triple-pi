@@ -28,14 +28,21 @@ Triple-pi/
 git clone --recurse-submodules https://github.com/npm-DreaMaX/Triple-pi.git
 cd Triple-pi
 
-# 2. 一键安装 + 构建 Pi + 构建 Triple-pi
+# 2. 一键安装：构建 Pi + 安装 Extension + 设置每日自动提取
 npm run setup
 
-# 3. 配置 LLM API Key（以 DeepSeek 为例）
+# 3. 配置 LLM API Key
+# 方式 A：环境变量
 export DEEPSEEK_API_KEY=sk-xxx
 
-# 4. 运行
-npm start
+# 方式 B：Pi 内置 /login 命令
+cd pi-runtime && ./pi-test.sh  # 进入后输入 /login
+
+# 4. 启动
+cd pi-runtime && ./pi-test.sh
+# 或通过 Triple-pi Extension 提供的 Memory 工具对话
+
+# 每天凌晨 3 点自动提取记忆（setup 已安装 cron，无需手动操作）
 ```
 
 ## 与 Pi 的关系
