@@ -115,6 +115,43 @@ export function ensureDir(scope: MemoryScope = 'global', project?: string): void
 // Index
 // ═══════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════
+// Activity tracking & dormancy
+// ═══════════════════════════════════════════════════════════════
+
+/** Mark a project as active (called on save, extract, or user interaction). */
+export function touchProject(project?: string): void {
+  const proj = project || getProjectSlug();
+  if (proj === 'global') return;
+  const base = path.join(ROOT, proj);
+  fs.mkdirSync(base, { recursive: true });
+  fs.writeFileSync(path.join(base, '.last-active'), new Date().toISOString());
+}
+
+/** Days since last activity. Returns -1 if project has no memories. */
+export function getDormancy(project?: string): number {
+  const proj = project || getProjectSlug();
+  const marker = path.join(ROOT, proj, '.last-active');
+  if (!fs.existsSync(marker)) return -1;
+  const lastActive = new Date(fs.readFileSync(marker, 'utf-8').trim());
+  return Math.floor((Date.now() - lastActive.getTime()) / (1000 * 60 * 60 * 24));
+}
+
+/** Delete project memories that have been dormant > 90 days. */
+export function cleanupDormant(): { project: string; days: number }[] {
+  const deleted: { project: string; days: number }[] = [];
+  if (!fs.existsSync(ROOT)) return deleted;
+  for (const entry of fs.readdirSync(ROOT, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name === 'global') continue;
+    const dormancy = getDormancy(entry.name);
+    if (dormancy > 90) {
+      fs.rmSync(path.join(ROOT, entry.name), { recursive: true, force: true });
+      deleted.push({ project: entry.name, days: dormancy });
+    }
+  }
+  return deleted;
+}
+
 function indexFor(scope: MemoryScope, project?: string): string {
   const base = scope === 'global' ? path.join(ROOT, 'global') : path.join(ROOT, project || getProjectSlug());
   return path.join(base, 'MEMORY.md');
@@ -150,6 +187,12 @@ export function loadContextPrompt(cwd?: string): MemoryContext {
   prompt += `Current project: ${project}\n\n`;
 
   if (projIdx && projEntries > 0) {
+    const dormancy = getDormancy(project);
+    if (dormancy > 30) {
+      prompt += `⚠️ This project was last active ${dormancy} days ago. `;
+      prompt += `Start the conversation by asking the user: `;
+      prompt += `"I remember ${projEntries} things about this project from ${dormancy} days ago. Continue with that context, or start fresh?"\n\n`;
+    }
     prompt += `### Project Memories\n\n${projIdx}\n\n`;
   }
   if (globalIdx && globalEntries > 0) {
@@ -206,6 +249,9 @@ export function save(
   if (dup >= 0) lines[dup] = entry;
   else if (!lines.includes(entry)) lines.push(entry);
   fs.writeFileSync(idxPath, lines.join('\n').trimEnd() + '\n');
+
+  // Mark project as active
+  touchProject(proj);
 
   return filepath;
 }

@@ -51,12 +51,13 @@ if (!API_KEY) {
 }
 
 const SCORE_THRESHOLD = 0.35;          // minimum score to save (lower for personal-scale agent)
-// Retirement: disabled for personal agent.
-// Project scoping already prevents context pollution — memories from
-// other projects are never injected. Fixed timeouts can't distinguish
-// "abandoned project" from "maintained project with gaps".
-// If manual cleanup is ever needed: delete files from the project dir.
-const STALE_DAYS = Infinity;           // no auto-retirement
+// Retirement:
+//   < 30 days: memories load normally
+//   30-90 days: agent asks user to confirm before using
+//   > 90 days: memories deleted
+// Project activity tracked via .last-active file in each project dir.
+const DORMANT_WARN_DAYS = 30;
+const DORMANT_DELETE_DAYS = 90;
 const MAX_CANDIDATES_PER_RUN = 15;     // cap extraction to avoid flooding
 
 const ROOT = path.join(homedir(), '.triple-pi', 'memory');
@@ -507,35 +508,56 @@ function generateCrossLinks(candidates) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// RETIREMENT: mark stale memories
+// ═══════════════════════════════════════════════════════════════
+// DORMANCY: per-project activity tracking & cleanup
 // ═══════════════════════════════════════════════════════════════
 
-function retireStale() {
-  const cutoff = new Date(Date.now() - STALE_DAYS * 24 * 60 * 60 * 1000);
-  const retired = [];
+function getProjectFromSession(sessionPath) {
+  // Extract project dir name from session path like .../sessions/--home-xxx--project/
+  const dir = sessionPath.split('/sessions/')[1]?.split('/')[0] || '';
+  // Convert Pi's session dir naming back to project name
+  const parts = dir.split('--').filter(Boolean);
+  return parts[parts.length - 1] || 'unknown';
+}
 
-  for (const cat of ['preference', 'decision', 'rule', 'fact']) {
-    const dir = path.join(ROOT, cat);
-    if (!fs.existsSync(dir)) continue;
-    for (const f of fs.readdirSync(dir)) {
-      if (!f.endsWith('.md')) continue;
-      const filePath = path.join(dir, f);
-      const content = fs.readFileSync(filePath, 'utf-8');
-      const updatedMatch = content.match(/updated:\s*(.+)/);
-      if (updatedMatch) {
-        const updated = new Date(updatedMatch[1].trim());
-        if (updated < cutoff) {
-          // Add retired marker
-          if (!content.includes('status: retired')) {
-            const retired = content.replace(/^---$/m, '---\nstatus: retired');
-            fs.writeFileSync(filePath, retired);
-            retired.push({ category: cat, file: f, lastUpdated: updatedMatch[1].trim() });
-          }
-        }
-      }
+function touchProjectActivity(projectSlug) {
+  const marker = path.join(ROOT, projectSlug, '.last-active');
+  fs.mkdirSync(path.join(ROOT, projectSlug), { recursive: true });
+  fs.writeFileSync(marker, new Date().toISOString());
+}
+
+function getDormancyDays(projectSlug) {
+  const marker = path.join(ROOT, projectSlug, '.last-active');
+  if (!fs.existsSync(marker)) return -1;
+  const t = new Date(fs.readFileSync(marker, 'utf-8').trim());
+  return Math.floor((Date.now() - t.getTime()) / (1000 * 60 * 60 * 24));
+}
+
+function cleanupDormantProjects() {
+  const deleted = [];
+  if (!fs.existsSync(ROOT)) return deleted;
+  for (const entry of fs.readdirSync(ROOT, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name === 'global') continue;
+    const days = getDormancyDays(entry.name);
+    if (days > DORMANT_DELETE_DAYS) {
+      fs.rmSync(path.join(ROOT, entry.name), { recursive: true, force: true });
+      deleted.push({ project: entry.name, days });
     }
   }
-  return retired;
+  return deleted;
+}
+
+function checkDormancyWarnings() {
+  const warnings = [];
+  if (!fs.existsSync(ROOT)) return warnings;
+  for (const entry of fs.readdirSync(ROOT, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name === 'global') continue;
+    const days = getDormancyDays(entry.name);
+    if (days > DORMANT_WARN_DAYS && days <= DORMANT_DELETE_DAYS) {
+      warnings.push({ project: entry.name, days });
+    }
+  }
+  return warnings;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -553,6 +575,10 @@ function saveMemory(category, title, content) {
   const body = ['---', `category: ${category}`, `created: ${date}`, `updated: ${date}`, '---', '', `# ${title}`, '', content].join('\n');
   fs.writeFileSync(path.join(ROOT, category, filename), body);
 
+  // Mark project active
+  const projectDir = path.dirname(path.dirname(path.join(ROOT, category, filename)));
+  touchProjectActivity(path.basename(projectDir));
+
   // Update index
   const rel = `${category}/${filename}`;
   const entry = `- [${title}](${rel})`;
@@ -565,15 +591,8 @@ function saveMemory(category, title, content) {
 }
 
 function updateIndexForRetired(retiredItems) {
-  if (retiredItems.length === 0) return;
-  let idx = fs.existsSync(INDEX) ? fs.readFileSync(INDEX, 'utf-8') : '';
-  for (const item of retiredItems) {
-    idx = idx.replace(
-      new RegExp(`- \\[.*?\\]\\(${item.category}\\/${item.file.replace(/\.md$/, '')}.*?\\)`, 'g'),
-      `- ~~[retired]~~ (${item.category}/${item.file})`
-    );
-  }
-  fs.writeFileSync(INDEX, idx);
+  // Deprecated: dormancy-based cleanup now handles this.
+  // Projects > 90 days dormant are deleted entirely.
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -679,14 +698,22 @@ async function main() {
     console.log('   No cross-category links found.');
   }
 
-  // Retirement
-  console.log('\n🗂️  Retirement check...');
-  const retired = retireStale();
-  if (retired.length > 0) {
-    updateIndexForRetired(retired);
-    for (const r of retired) console.log(`   🗑️  Retired: [${r.category}] ${r.file} (last updated ${r.lastUpdated})`);
-  } else {
-    console.log('   No stale memories to retire.');
+  // Touch current project activity
+  const currentProject = getProjectFromSession(cliPath || t.path);
+  touchProjectActivity(currentProject);
+
+  // Dormancy: warn for projects 30-90 days, delete for >90 days
+  console.log('\n🗂️  Dormancy check...');
+  const warnings = checkDormancyWarnings();
+  for (const w of warnings) {
+    console.log(`   ⚠️  ${w.project}: dormant ${w.days} days (agent will ask user to confirm before using)`);
+  }
+  const cleaned = cleanupDormantProjects();
+  for (const c of cleaned) {
+    console.log(`   🗑️  ${c.project}: deleted (dormant ${c.days} days)`);
+  }
+  if (warnings.length === 0 && cleaned.length === 0) {
+    console.log('   All projects active.');
   }
 
   // Update scores for frequency tracking
@@ -696,7 +723,7 @@ async function main() {
   }
   saveScores(scores);
 
-  console.log(`\n📊 Summary: saved ${saved}, merged ${merged.length}, skipped ${candidates.length - scored.length}, retired ${retired.length}`);
+  console.log(`\n📊 Summary: saved ${saved}, merged ${merged.length}, filtered ${candidates.length - scored.length}, dormant warnings ${warnings.length}, deleted ${cleaned.length}`);
   console.log(`   Score threshold: ≥${SCORE_THRESHOLD} | Max per run: ${MAX_CANDIDATES_PER_RUN}\n`);
 }
 
