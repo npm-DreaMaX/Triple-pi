@@ -143,10 +143,28 @@ Before extracting anything, ask: **"Will this information change how the agent s
 Only extract information that passes this test:
 **"Will this change how the agent should behave 3 months from now, and is this information NOT already stored in a project file?"**
 
-1. **User preferences** — communication style, code style, tools/libraries the user explicitly likes or dislikes
-2. **Technical decisions** — WHY something was chosen (not WHAT was installed). Must include the reason.
-3. **Project rules** — constraints the agent must follow
-4. **Important facts** — context about the project that is NOT discoverable by reading project files
+Categories:
+
+1. **knowledge** — The user's knowledge level, what they've already learned or built.
+   THIS IS THE MOST IMPORTANT CATEGORY. It determines the agent's starting point.
+   - "用户已经读过 agent-loop.ts 源码" → knowledge (don't explain basics again)
+   - "用户熟悉 TypeScript 但不太懂 Rust" → knowledge (adjust explanation depth)
+   - "用户已经完成了 auth 模块的重构" → knowledge (don't suggest redoing it)
+   - "用户第一次接触 Docker" → knowledge (explain Docker concepts from scratch)
+   Why this matters: If the agent doesn't know what the user already knows,
+   it wastes time explaining things the user already understands — or worse,
+   assumes knowledge the user doesn't have.
+
+2. **preference** — Communication style, code style, tools the user likes/dislikes.
+   Must be explicitly stated by the user, not inferred.
+
+3. **decision** — WHY something was chosen. Must include the reason.
+   Skip: "安装了 X" (config files already record this).
+
+4. **rule** — Constraints the agent must follow. Must be explicitly stated.
+
+5. **fact** — Context NOT discoverable from project files. Skip anything the
+   agent could find by reading package.json, tsconfig, or source code.
 
 ## What to SKIP
 
@@ -235,7 +253,7 @@ function parseCandidates(text) {
     else throw new Error(`Bad JSON: ${text.slice(0, 300)}`);
   }
 
-  const validCats = new Set(['preference', 'decision', 'rule', 'fact']);
+  const validCats = new Set(['preference', 'decision', 'rule', 'fact', 'knowledge']);
   return (parsed.candidates || []).filter(c =>
     validCats.has(c.category) && c.title && c.content && c.evidence
   );
@@ -269,12 +287,16 @@ function scoreCandidate(candidate, messages, existingMemories) {
   const allText = messages.map(m => m.content.toLowerCase()).join(' ');
 
   // ── Frequency (0.24): how many times was this topic mentioned ──
+  // Knowledge statements are typically stated once — don't penalize them
   const keywords = title.split(/\s+/).filter(w => w.length > 2);
   const mentions = keywords.reduce((sum, kw) => {
     const matches = allText.split(kw).length - 1;
     return sum + matches;
   }, 0) / Math.max(1, keywords.length);
-  const freqScore = Math.min(1, mentions / 3) * 0.24;  // cap at 3 mentions (personal scale)
+  const isKnowledge = candidate.category === 'knowledge';
+  const freqScore = isKnowledge
+    ? 0.24  // knowledge: full score (stated once is enough)
+    : Math.min(1, mentions / 3) * 0.24;
 
   // ── Relevance (0.30): is this about tech/code/work or casual chat? ──
   const techTerms = ['typescript', 'javascript', 'python', 'api', 'auth', 'token',
@@ -364,7 +386,7 @@ function validateEvidence(candidate, messages) {
 
 function loadExistingMemories() {
   const memories = {};
-  for (const cat of ['preference', 'decision', 'rule', 'fact']) {
+  for (const cat of ['preference', 'decision', 'rule', 'fact', 'knowledge']) {
     const dir = path.join(ROOT, cat);
     if (!fs.existsSync(dir)) continue;
     for (const f of fs.readdirSync(dir)) {

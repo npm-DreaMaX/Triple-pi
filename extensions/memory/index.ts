@@ -51,7 +51,7 @@ const saveMemoryTool = defineTool({
       title: string;
       content: string;
     };
-    const valid = ["preference", "decision", "rule", "fact"];
+    const valid = ["preference", "decision", "rule", "fact", "knowledge"];
     if (!valid.includes(category)) {
       return {
         content: [{ type: "text", text: `无效分类 "${category}"。有效值：${valid.join(", ")}` }],

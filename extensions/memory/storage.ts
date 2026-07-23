@@ -10,7 +10,7 @@ import * as path from 'node:path';
 import { homedir } from 'node:os';
 
 // Types
-export type MemoryCategory = 'preference' | 'decision' | 'rule' | 'fact';
+export type MemoryCategory = 'preference' | 'decision' | 'rule' | 'fact' | 'knowledge';
 
 export interface MemoryEntry {
   path: string;
@@ -29,7 +29,7 @@ export interface SearchResult {
 // Paths
 const ROOT = path.join(homedir(), '.triple-pi', 'memory');
 const INDEX = path.join(ROOT, 'MEMORY.md');
-const CATS: MemoryCategory[] = ['preference', 'decision', 'rule', 'fact'];
+const CATS: MemoryCategory[] = ['preference', 'decision', 'rule', 'fact', 'knowledge'];
 
 // Init
 export function ensureDir(): void {
