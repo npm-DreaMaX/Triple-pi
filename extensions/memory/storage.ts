@@ -187,13 +187,7 @@ export function loadContextPrompt(cwd?: string): MemoryContext {
   prompt += `Current project: ${project}\n\n`;
 
   if (projIdx && projEntries > 0) {
-    const dormancy = getDormancy(project);
-    if (dormancy > 30) {
-      prompt += `⚠️ This project was last active ${dormancy} days ago. `;
-      prompt += `Start the conversation by asking the user: `;
-      prompt += `"I remember ${projEntries} things about this project from ${dormancy} days ago. Continue with that context, or start fresh?"\n\n`;
-    }
-    prompt += `### Project Memories\n\n${projIdx}\n\n`;
+    prompt += `### Project Memories (${projEntries})\n\n${projIdx}\n\n`;
   }
   if (globalIdx && globalEntries > 0) {
     prompt += `### Global Memories\n\n${globalIdx}\n`;

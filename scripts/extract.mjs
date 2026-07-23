@@ -6,10 +6,12 @@
  * PIPELINE (inspired by OpenClaw Dreaming)
  * ============================================================================
  *
- * Phase 1 (Light Sleep):  LLM scans transcript → extracts candidates with evidence
- * Phase 2 (Scoring):      6-dim weighted scoring per candidate
- * Phase 3 (Deep Sleep):   Merge duplicates, update existing, retire stale
- * Phase 4 (REM):          Cross-category linking notes
+ * Phase 1 (Light Sleep):   LLM scans transcript → extracts candidates with evidence
+ * Phase 2 (Scoring):       6-dim weighted scoring per candidate
+ * Phase 2.5 (Deep Sleep):  SECOND LLM call — reviews quality, removes noise,
+ *                          merges similar candidates, filters discoverable info
+ * Phase 3 (Merge):         Deterministic Jaccard dedup within project
+ * Phase 4 (REM):           Cross-category linking notes
  *
  * ============================================================================
  * SCORING FORMULA (same weights as OpenClaw)
@@ -51,14 +53,10 @@ if (!API_KEY) {
 }
 
 const SCORE_THRESHOLD = 0.35;          // minimum score to save (lower for personal-scale agent)
-// Retirement:
-//   < 30 days: memories load normally
-//   30-90 days: agent asks user to confirm before using
-//   > 90 days: memories deleted
-// Project activity tracked via .last-active file in each project dir.
-const DORMANT_WARN_DAYS = 30;
-const DORMANT_DELETE_DAYS = 90;
-const MAX_CANDIDATES_PER_RUN = 15;     // cap extraction to avoid flooding
+// Dormancy: project unused for DORMANT_DELETE_DAYS → memories deleted.
+// Personal dev cycle is short. 30 days of inactivity = abandoned project.
+const DORMANT_DELETE_DAYS = 30;
+const MAX_CANDIDATES_PER_RUN = 15;
 
 const ROOT = path.join(homedir(), '.triple-pi', 'memory');
 const INDEX = path.join(ROOT, 'MEMORY.md');
@@ -394,7 +392,152 @@ function validateEvidence(candidate, messages) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// PHASE 3: DEEP SLEEP — Merge & Dedup
+// PHASE 2.5: DEEP SLEEP — LLM Quality Review
+// ═══════════════════════════════════════════════════════════════
+//
+// SECOND LLM CALL. Takes scored candidates and asks LLM to:
+// 1. Merge candidates that say the same thing differently
+// 2. Remove low-quality or redundant candidates
+// 3. Keep only genuinely useful memories
+//
+// WHY: scoring formula can count keywords but can't judge usefulness.
+// Only LLM can tell "agent-loop.ts export path" is less useful than
+// "user read agent-loop.ts and understands the architecture".
+
+const DEEP_SLEEP_PROMPT = `You are a memory quality reviewer. Review these candidate memories
+extracted from a coding session. Your job is to FILTER and MERGE.
+
+## What to REMOVE
+
+1. **Discoverable information**: Anything the agent can find by reading source code or config files
+   - "项目用 TypeScript" → REMOVE (tsconfig.json exists)
+   - "测试框架是 vitest" → REMOVE (package.json exists)
+   - "Pi 工具接口是 AgentTool" → REMOVE (source code exists)
+
+2. **Trivia**: Interesting but not useful for future work
+   - "Pi 的 CLI 用 --model 参数" → REMOVE (one-time config fact)
+
+3. **Extension/tool installs**: Already encoded in config files
+   - "装了 prettier" → REMOVE
+
+## What to MERGE
+
+Candidates that say the same thing in different words:
+- "Pi 没有 MEMORY.md" + "Pi 没有跨 session 记忆" → MERGE into one
+- "用户偏好简洁" + "用户不喜欢冗长解释" → MERGE into one
+
+## What to KEEP
+
+1. **User knowledge**: What the user has learned, their expertise level
+2. **User preferences**: Communication style, code style — explicitly stated
+3. **Decisions with reasons**: WHY something was chosen
+4. **Project rules**: Constraints the agent must follow
+5. **Context not in code**: Project background, future plans, architecture decisions
+
+## Input format
+
+You will receive a list of candidates with scores and evidence.
+
+## Output format
+
+Return ONLY valid JSON:
+{
+  "approved": [
+    {
+      "category": "knowledge|preference|decision|rule|fact",
+      "title": "short title",
+      "content": "merged and refined content",
+      "merged_from": ["original titles that were merged"]  // optional
+    }
+  ]
+}
+
+Aim for 3-8 approved candidates. When in doubt, REMOVE.`;
+
+async function deepSleepReview(candidates, apiKey) {
+  if (candidates.length === 0) return [];
+  if (candidates.length <= 2) return candidates; // too few to need review
+
+  const candidateList = candidates.map((c, i) =>
+    `${i + 1}. [${c.category}] "${c.title}" (score: ${c.score})\n` +
+    `   Content: ${c.content.slice(0, 150)}\n` +
+    `   Evidence: "${c.evidence.slice(0, 100)}"`
+  ).join('\n\n');
+
+  const isAnthropic = apiKey.startsWith('sk-ant-');
+  let text;
+
+  if (isAnthropic) {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6', max_tokens: 2000, temperature: 0.2,
+        system: DEEP_SLEEP_PROMPT,
+        messages: [{ role: 'user', content: `Review these candidates:\n\n${candidateList}` }],
+      }),
+    });
+    if (!res.ok) throw new Error(`Deep Sleep Anthropic: ${res.status}`);
+    const data = await res.json();
+    text = data.content?.[0]?.text || '';
+  } else {
+    const res = await fetch('https://api.deepseek.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model: 'deepseek-chat', temperature: 0.2, max_tokens: 2000,
+        messages: [
+          { role: 'system', content: DEEP_SLEEP_PROMPT },
+          { role: 'user', content: `Review these candidates:\n\n${candidateList}` },
+        ],
+      }),
+    });
+    if (!res.ok) throw new Error(`Deep Sleep DeepSeek: ${res.status}`);
+    const data = await res.json();
+    text = data.choices?.[0]?.message?.content || '';
+  }
+
+  // Parse response
+  let json = text.trim();
+  const fence = json.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
+  if (fence) json = fence[1].trim();
+
+  let parsed;
+  try { parsed = JSON.parse(json); } catch {
+    // If parsing fails, return original candidates (fail open — don't lose memories)
+    console.log('   ⚠️  Deep Sleep response unparseable, keeping original candidates');
+    return candidates;
+  }
+
+  const approved = parsed.approved || [];
+  if (approved.length === 0) {
+    console.log('   Deep Sleep rejected all candidates');
+    return [];
+  }
+
+  // Map back to original candidate objects where possible
+  const result = [];
+  for (const a of approved) {
+    const existing = candidates.find(c =>
+      c.title.toLowerCase() === a.title.toLowerCase() ||
+      (a.merged_from || []).some((m) => c.title.toLowerCase() === m.toLowerCase())
+    );
+    result.push({
+      category: a.category || existing?.category || 'fact',
+      title: a.title,
+      content: a.content,
+      evidence: existing?.evidence || '',
+      score: existing?.score || 0,
+      breakdown: existing?.breakdown || {},
+      evidenceValid: true,
+    });
+  }
+
+  return result;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PHASE 3: DEEP SLEEP — Merge & Dedup (deterministic Jaccard pass)
 // ═══════════════════════════════════════════════════════════════
 
 function loadExistingMemories() {
@@ -548,16 +691,8 @@ function cleanupDormantProjects() {
 }
 
 function checkDormancyWarnings() {
-  const warnings = [];
-  if (!fs.existsSync(ROOT)) return warnings;
-  for (const entry of fs.readdirSync(ROOT, { withFileTypes: true })) {
-    if (!entry.isDirectory() || entry.name === 'global') continue;
-    const days = getDormancyDays(entry.name);
-    if (days > DORMANT_WARN_DAYS && days <= DORMANT_DELETE_DAYS) {
-      warnings.push({ project: entry.name, days });
-    }
-  }
-  return warnings;
+  // Simplified: >30 days = delete. No warning tier.
+  return [];
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -672,9 +807,19 @@ async function main() {
     process.exit(0);
   }
 
-  // Phase 3: Deep Sleep — Merge
-  console.log('💤 Phase 3: Deep Sleep — Merge & Dedup...');
-  const { toSave, merged } = mergeMemories(filtered, existingMemories);
+  // Phase 2.5: Deep Sleep — LLM quality review
+  console.log('💤 Phase 2.5: Deep Sleep — LLM quality review...');
+  const reviewed = await deepSleepReview(filtered, API_KEY);
+  console.log(`   ${filtered.length} candidates → ${reviewed.length} after review`);
+  if (reviewed.length < filtered.length) {
+    const removed = filtered.filter(c => !reviewed.find(r => r.title === c.title));
+    for (const r of removed) console.log(`   ❌ Removed: "${r.title}"`);
+  }
+  console.log('');
+
+  // Phase 3: Merge & Dedup
+  console.log('🔗 Phase 3: Merge & Dedup...');
+  const { toSave, merged } = mergeMemories(reviewed, existingMemories);
   console.log(`   Merged/updated: ${merged.length} | New to save: ${toSave.length}`);
   for (const m of merged) {
     console.log(`   🔗 ${m.action}: "${m.existing || m.candidate1}" ↔ "${m.candidate || m.candidate2}"`);
@@ -702,18 +847,14 @@ async function main() {
   const currentProject = getProjectFromSession(cliPath || t.path);
   touchProjectActivity(currentProject);
 
-  // Dormancy: warn for projects 30-90 days, delete for >90 days
-  console.log('\n🗂️  Dormancy check...');
-  const warnings = checkDormancyWarnings();
-  for (const w of warnings) {
-    console.log(`   ⚠️  ${w.project}: dormant ${w.days} days (agent will ask user to confirm before using)`);
-  }
+  // Dormancy: >30 days inactivity → delete project memories
+  console.log('\n🗂️  Dormancy check (>30 days → delete)...');
   const cleaned = cleanupDormantProjects();
   for (const c of cleaned) {
     console.log(`   🗑️  ${c.project}: deleted (dormant ${c.days} days)`);
   }
-  if (warnings.length === 0 && cleaned.length === 0) {
-    console.log('   All projects active.');
+  if (cleaned.length === 0) {
+    console.log('   All projects active (within 30 days).');
   }
 
   // Update scores for frequency tracking
@@ -723,7 +864,7 @@ async function main() {
   }
   saveScores(scores);
 
-  console.log(`\n📊 Summary: saved ${saved}, merged ${merged.length}, filtered ${candidates.length - scored.length}, dormant warnings ${warnings.length}, deleted ${cleaned.length}`);
+  console.log(`\n📊 Summary: saved ${saved}, merged ${merged.length}, filtered ${candidates.length - reviewed.length}, deleted ${cleaned.length}`);
   console.log(`   Score threshold: ≥${SCORE_THRESHOLD} | Max per run: ${MAX_CANDIDATES_PER_RUN}\n`);
 }
 
