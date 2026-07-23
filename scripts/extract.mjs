@@ -126,53 +126,49 @@ function loadTranscript(jsonlPath) {
 // ═══════════════════════════════════════════════════════════════
 
 const EXTRACTION_PROMPT = `You are a memory extraction system for a personal coding agent.
-Read this conversation between a developer and their coding agent.
-Extract ONLY information that should persist across future sessions.
+Read this conversation and extract ONLY information that should change how the agent behaves in future sessions.
 
-## What to extract (with examples)
+## The "Permanence Test"
 
-1. **User preferences**:
-   - "用户禁止使用 any 类型" → preference
-   - "用户偏好中文回复，代码注释用英文" → preference
-   - "用户喜欢简洁回复，不要冗长解释" → preference
+Before extracting anything, ask: **"Will this information change how the agent should act 3 months from now?"**
 
-2. **Technical decisions**:
-   - "auth 模块选择 JWT 而非 session，因为多服务无状态需求" → decision
-   - "选择 pnpm 而非 npm，因为 monorepo 支持更好" → decision
+- ✅ "User hates 'any' type" → YES, affects all future code the agent writes
+- ✅ "Auth uses JWT because multi-service stateless" → YES, constrains future architecture decisions
+- ❌ "We installed prettier-plugin-tailwind" → NO, already in package.json, the agent can read it
+- ❌ "The CLI flag is --model not MODEL env var" → NO, one-time config trivia
+- ❌ "package name is @earendil-works/pi-agent" → NO, the agent can read package.json
 
-3. **Project rules**:
-   - "不允许 git push 到 main 分支" → rule
-   - "不允许删除 .env 文件" → rule
-   - "API 返回值必须用 { code, data, message } 包裹" → rule
+## What TO extract
 
-4. **Important facts**:
-   - "项目是 TypeScript monorepo，pnpm workspace 管理" → fact
-   - "测试框架使用 vitest" → fact
+Only extract information that passes this test:
+**"Will this change how the agent should behave 3 months from now, and is this information NOT already stored in a project file?"**
+
+1. **User preferences** — communication style, code style, tools/libraries the user explicitly likes or dislikes
+2. **Technical decisions** — WHY something was chosen (not WHAT was installed). Must include the reason.
+3. **Project rules** — constraints the agent must follow
+4. **Important facts** — context about the project that is NOT discoverable by reading project files
 
 ## What to SKIP
 
-- Debugging: "试试这个能不能编译", "报错了，换一种写法"
-- Testing: "你能不能调 SaveMemory", "测试一下工具"
-- Chit-chat: "今天天气不错", "谢谢"
-- Temporary: "先用 hardcode，后面再改"
-- Single-session context: "打开 login.ts 第 42 行"
+- Tool/extension installations (already stored in config files)
+- Package names, CLI commands, API details (agent can read code/docs)
+- One-time configuration steps (done once, never needed again)
+- ANYTHING the agent could discover by reading package.json, tsconfig, or other project files
+- Debugging, testing, chit-chat, session-only context
 
-## Rules
+## CRITICAL
 
-- EVERY candidate MUST include an **exact quote** from the transcript as evidence
-- When in doubt, SKIP. Better to miss one than to save junk.
-- A personal developer agent typically has 20-50 memories, not 500.
-- Be specific. "用户偏好 TypeScript" is worse than "用户偏好 TypeScript strict 模式，禁用了 any 类型"
+**The examples in this prompt are EXAMPLES ONLY. Do NOT extract them unless they actually appear in the conversation. Only extract what is ACTUALLY DISCUSSED in this specific transcript.**
 
 ## Output format
 
-Return ONLY valid JSON. No markdown, no explanation:
+Return ONLY valid JSON:
 {
   "candidates": [
     {
       "category": "preference|decision|rule|fact",
       "title": "short title",
-      "content": "detailed memory with context and rationale",
+      "content": "what to remember AND why it matters for future behavior",
       "evidence": "exact quote from transcript"
     }
   ]
@@ -343,16 +339,23 @@ function scoreCandidate(candidate, messages, existingMemories) {
 // ═══════════════════════════════════════════════════════════════
 
 function validateEvidence(candidate, messages) {
-  const fullText = messages.map(m => m.content).join(' ');
+  const fullText = messages.map(m => m.content).join(' ').toLowerCase();
   // Exact substring match (case-insensitive)
-  const evidence = candidate.evidence.trim();
-  if (fullText.toLowerCase().includes(evidence.toLowerCase())) return true;
+  const evidence = candidate.evidence.trim().toLowerCase();
+  if (fullText.includes(evidence)) return true;
 
-  // Fuzzy: at least 80% of significant words must appear
-  const words = evidence.split(/\s+/).filter(w => w.length > 3);
-  if (words.length === 0) return false;
-  const matched = words.filter(w => fullText.toLowerCase().includes(w.toLowerCase()));
-  return matched.length / words.length >= 0.7;  // 70% fuzzy match (personal agent, shorter transcripts)
+  // Fuzzy: extract key terms from BOTH evidence and candidate content
+  const allSignal = (candidate.content + ' ' + evidence).toLowerCase();
+  // Extract meaningful tokens (Chinese: 2+ chars, English: 4+ chars)
+  const tokens = [
+    ...allSignal.matchAll(/[一-鿿]{2,}/g),
+    ...allSignal.matchAll(/[a-z]{4,}/g),
+  ].map(m => m[0]).filter(t => t.length > 1);
+
+  if (tokens.length === 0) return false;
+  const matched = tokens.filter(t => fullText.includes(t));
+  // 60% of key terms must appear in transcript
+  return matched.length / tokens.length >= 0.6;
 }
 
 // ═══════════════════════════════════════════════════════════════
