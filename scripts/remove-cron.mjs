@@ -1,23 +1,27 @@
 #!/usr/bin/env node
-/**
- * Remove the Triple-pi cron job.
- */
-import { execSync } from 'node:child_process';
+import { execFileSync } from "node:child_process";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 
 try {
-  const existing = execSync('crontab -l 2>/dev/null || true', { encoding: 'utf-8' });
-  const filtered = existing.split('\n')
-    .filter(line => !line.includes('triple-pi') || !line.includes('extract'))
-    .join('\n')
-    .replace(/\n{2,}/g, '\n');
-
-  if (filtered.trim()) {
-    execSync(`echo "${filtered.replace(/"/g, '\\"')}" | crontab -`);
-  } else {
-    execSync('crontab -r 2>/dev/null || true');
+  let existing = "";
+  try { existing = execFileSync("crontab", ["-l"], { encoding: "utf8" }); } catch {}
+  const projectDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const exact = `0 3 * * * cd ${projectDir} && npm run extract >> ~/.triple-pi/extract.log 2>&1`;
+  const lines = existing.split("\n");
+  const filtered = lines.filter((line) => line.trim() !== exact && line.trim() !== "# triple-pi-memory-legacy");
+  const removed = lines.length - filtered.length;
+  if (removed === 0) {
+    console.log("[triple-pi] No canonical legacy cron entry found.");
+    process.exit(0);
   }
-  console.log('[triple-pi] Cron removed.');
-} catch (err) {
-  console.error('[triple-pi] Failed to remove cron:', err.message);
+  const content = filtered.join("\n").replace(/^\n+|\n+$/g, "");
+  if (content) execFileSync("crontab", ["-"], { input: `${content}\n` });
+  else {
+    try { execFileSync("crontab", ["-r"]); } catch {}
+  }
+  console.log(`[triple-pi] Removed ${removed} canonical legacy cron line(s).`);
+} catch (error) {
+  console.error("[triple-pi] Failed to remove legacy cron:", error instanceof Error ? error.message : String(error));
   process.exit(1);
 }

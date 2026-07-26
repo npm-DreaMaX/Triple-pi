@@ -1,127 +1,307 @@
-# Triple-pi 面试答辩 — Eval 模块
+# Triple-pi Eval 系统面试指南
 
-> Memory 做完了，怎么证明它真的有效？这篇文档记录 Eval 的设计、踩坑、实验数据和结论。
-
----
-
-## 一、为什么需要 Eval
-
-**没有 Eval，Memory 模块的价值只是"我觉得有用"。** 面试官问你"你怎么知道你的记忆系统比不用好"，如果没有数据，你只能靠嘴说。
-
-Eval 做的是：用可控的合成 transcript，验证提取器在每个维度上是否正确。
+> 为什么旧系统宣称"10/10 全通过"是不可信的，以及我们如何建立一个真正能证明系统工作的验证体系。
 
 ---
 
-## 二、设计思路
+## 背景：为什么要重做 Eval？
 
-### 为什么用合成 transcript 而不是真实数据
+### 旧 Eval 的 10 个致命缺陷
 
-| | 真实 transcript | 合成 transcript |
-|---|---|---|
-| ground truth | 需要人工标注，还猜不准 | 我写的时候就知道该提取什么 |
-| 边界 case | 不一定覆盖到 | 专门构造（空对话、多偏好、纠正信号） |
-| 可复现 | LLM 输出会变，标注不会变 | transcript 不变，ground truth 不变 |
-| 隐私 | 包含真实对话 | 全是编的 |
+旧 runner 宣称"10/10 case 通过"，但实际上：
 
-我选择合成数据——不是因为真实数据不好，而是因为**我需要 100% 确定的 ground truth，不需要人工标注。**
-
-### 断言为什么是确定性的，不用 LLM-as-judge
-
-教程的做法是 `assertions: ['输出中包含项目名称']`——这是 LLM-as-judge：你让另一个 LLM 来判断"输出里有没有项目名称"。问题：1) LLM 判断也可能错；2) 每次判断结果可能不一样。
-
-我的做法是代码验证：检查提取器输出的结构化数据（category、title），匹配预期的关键词。
-
+**1. Category-only assertion**
 ```javascript
-// 代码验证（确定性，可复现）
-mustContain: [{ category: 'knowledge', reason: '应该提取用户知识声明' }]
+// 旧代码：只检查 category 字段
+mustContain: [{ category: "rule" }]
+// 如果 LLM 返回 { category: "rule", title: "随便编的", content: "胡言乱语" }
+// → 通过！因为只检查了 category
+```
+现在：检查 category + scope + title atoms + content atoms + evidence atom + forbidden atoms。
 
-// LLM-as-judge（教程的做法，不可复现）
-assertions: ['输出中包含项目名称']  // 谁来判断？
+**2. 默认 tolerance=1**
+```javascript
+// 旧代码的 "容错"
+tolerance: 1
+// minExpected: 1, tolerance: 1 → 允许 0 条结果，永远通过
+// maxExpected: 0, tolerance: 1 → 允许 1 条结果（noise case 有结果也算通过）
+```
+现在：**没有 tolerance**。缺了就是 FN，多了就是 FP。
+
+**3. Provider 错误 → 空结果 → 假通过**
+```javascript
+// 如果 LLM API 调用失败，返回空数组 []
+// noise case（预期 0 条记忆）→ 空结果与预期匹配 → ✅ 通过
+// 但实际上：根本没调用成功，不是"正确判断了没有记忆"
+```
+现在：基础设施错误 exit 2，和语义错误 exit 1 严格区分。
+
+**4. 一个结果可以满足多个 expected**
+旧代码的 matching 是 `for each prediction, for each expected, if match → count`。一条结果匹配到多个 expected 后可能产生"假 TP"。
+
+现在：双向一对一匹配。一条 prediction 最多匹配一个 expected，一个 expected 最多被一条 prediction 满足。
+
+**5. Correction case 的重复 key 覆盖**
+```javascript
+// JavaScript 对象的 key 重复取最后一个
+{ title: "use-jwt", title: "use-oauth" }
+// 只有 "use-oauth" 保留，"use-jwt" 被静默覆盖 → case 不完整
+```
+
+**6. Project isolation 只测了 project A**
+只验证了 project A 的记忆在 project A 中可见，没验证 project B **不可见**。
+
+**7. Cross-session 只是文本 marker**
+不是真实的两个 Session 启动/新 prompt 注入，只是同一个 JSONL 里的 `--- NEW SESSION ---` 文本分割。
+
+**8. knowledge case 的 minTotal=0**
+"用户不熟悉某技术"的 case 设置 `minTotal=0`，永远绿——即使知识记忆完全没提取出来，也是 0 ≥ 0。
+
+**9. stdout parser 解析文案而非数据结构**
+旧 Eval 解析 `console.log` 的字符串输出做断言。输出文案改了 Eval 就挂，且没有任何类型安全。
+
+**10. 没有测试整条链路**
+只测了 extraction 候选输出，没测 review、consolidation、repository 写入、next-session recall 这些后续步骤。
+
+### 面试话术
+
+> "旧 Eval 的问题不是某几个 case 错了，而是整个验证框架不可信——category-only assertion 不检查实际内容、tolerance 容忍假阴性、provider 错误被当成正确结果、project isolation 没有反向验证。这说明：不能用看似通过的指标来证明质量，要检查指标本身是不是在测正确的东西。"
+
+---
+
+## 三层验证架构
+
+```
+Layer 1: Deterministic Tests (CI 门)
+  npm test              → 99 tests, 0 network, 0 LLM
+  npm run typecheck     → TypeScript 全项目类型检查
+
+Layer 2: Recorded Full-Stack Eval (接线验证)
+  npm run eval:recorded → 18 cases, mock LLM, 完整 pipeline
+
+Layer 3: Live Eval (模型质量验证)
+  npm run eval:live     → 真实 LLM, opt-in, 统计分布
+```
+
+### Layer 1: 确定性测试
+
+**测什么**：代码逻辑的正确性，不依赖 LLM。
+
+覆盖矩阵：
+| 模块 | 测试文件 | 核心验证点 |
+|---|---|---|
+| project-identity | `project-identity.test.ts` | cwd hash 稳定性、同 basename 隔离、特殊字符 |
+| repository | `repository.test.ts` | 项目隔离、createdAt 保留、路径穿越、索引重建、损坏隔离、20 并发、索引失败不报假错 |
+| lifecycle | `lifecycle.test.ts` | 30/90 天阈值、fake clock 边界、冷态确认、归档写保护 |
+| extraction source | `extraction-source.test.ts` | branch delta、checkpoint、source hash 幂等 |
+| extraction pipeline | `extraction-pipeline.test.ts` | secret redaction、strict validation、evidence 校验、schema rejection |
+| review | `review.test.ts` | keep/remove、改写拒绝、格式错误拒绝 |
+| signals+consolidation | `signals-consolidation.test.ts` | fingerprint 稳定、correction 检测、分层匹配、category 隔离 |
+| working-state | `working-state.test.ts` | scratchpad 生成、daily 滚动、source 幂等、secret redaction |
+| extension | `extension.integration.test.ts` | SaveMemory 确认/拒绝/无UI、before_agent_start 注入、SearchMemory |
+| install/status/reset | `install-extension.test.ts` + `status-reset.test.ts` | 首次安装、重复安装、broken symlink、777 权限拒绝、dry-run |
+| eval metrics | `metrics.test.ts` | TP/FP/FN 计算、F1、一对一匹配 |
+
+**为什么不用 mock 文件系统**：repository 测试使用 `fs.mkdtemp` 创建真实临时目录，因为 `fs.rename`、`fs.chmod`、文件锁等行为在 mock 中不可靠。
+
+### Layer 2: Recorded Full-Stack Eval
+
+**原理**：用预定义的 FIFO recorded provider 替代真实 LLM。每个 test case 的"LLM 输出"是手写的，但走真实 pipeline 全链路。
+
+```typescript
+// recorded-cases.ts
+function recordedOutput(testCase: EvalCase): RecordedEvalCase {
+  // 把 expected memory 转换成"LLM 会返回的候选格式"
+  const extraction = testCase.expected.map(e => ({
+    category: e.category,
+    scope: e.scope,
+    title: e.titleIncludes.join(" "),
+    content: e.contentIncludes.join("; "),
+    evidence: extractEvidenceFromUser(testCase.user, e.evidenceIncludes),
+    sourceEntryId: e.sourceEntryId,
+  }));
+  // Review 输出：全部 keep（因为这是正确答案的录制）
+  const review = extraction.map(c => ({
+    action: "keep", reason: "recorded grounded fixture",
+    title: c.title, content: c.content,
+    evidence: c.evidence, sourceEntryId: c.sourceEntryId,
+  }));
+  return { extraction, review };
+}
+```
+
+**验证链路**：
+```
+recorded provider 输出（手写正确数据）
+  → pipeline.ts validateCandidates()    ← 验证 schema/evidence
+  → review.ts reviewCandidates()        ← 验证 review 流程
+  → signals.ts scoreCandidate()         ← 验证 signal 计算
+  → consolidation.ts planConsolidation() ← 验证去重策略
+  → repository.saveExtractionBatch()    ← 验证事务写入
+  → repository.list()                   ← 验证记录正确落盘
+  → metrics.ts evaluateRecords()        ← 验证 F1=1.0
+```
+
+**Recorded Eval 证明什么**：整条 pipeline 的接线是正确的——数据从 extraction 流到 repository 的全过程没有逻辑错误。
+
+**Recorded Eval 不证明什么**：LLM 真的能从任意对话中提取出正确记忆。那需要 Live Eval。
+
+**Eval Cases**：
+```
+project-rule:      "Always run unit tests..." → 提取出 rule
+global-preference: "Across all my projects..." → 提取出 global preference
+correction:        "Actually, use JWT instead..." → correction 信号 + replace
+noise-only:        "Try rerunning that once..." → 无记忆提取（空结果算满分）
+knowledge:         "I have never used Rust..." → 提取出 knowledge
+```
+
+### Layer 3: Live Eval
+
+**为什么是 opt-in**：
+- 需要真实的 API key 和网络
+- 产生 API 费用
+- 结果有随机性（依赖 LLM 输出）
+- 不适合做 CI 发布门
+
+**使用方式**：
+```bash
+# 必须显式指定 model 和 runs
+TRIPLE_PI_EVAL_MODEL=anthropic/claude-sonnet-5
+TRIPLE_PI_EVAL_RUNS=3
+npm run eval:live
+```
+
+**报告内容**：
+```
+Model: anthropic/claude-sonnet-5
+Runs: 3
+Extractor version: 1
+
+Case results:
+  project-rule:      3/3 ✓
+  global-preference: 3/3 ✓
+  correction:        2/3 ✓ (run 2: evidence mismatch)
+  noise-only:        3/3 ✓
+  knowledge:         3/3 ✓
+
+Aggregate:
+  mean F1:    0.933
+  variance:   0.008
+  worst F1:   0.800
+```
+
+**Exit codes**：
+| Exit | 含义 | 示例 |
+|---|---|---|
+| 0 | 全部通过 | 所有 case semantic gate 满足 |
+| 1 | 语义错误 | 模型输出不符合 ground truth |
+| 2 | 基础设施错误 | API key 没配、网络不通、模型不存在 |
+
+Exit 2 和 Exit 1 的分离至关重要——前者不是"模型不行"而是"没跑成"，不能混为一谈。
+
+**为什么 Live 不进 CI？**
+- CI 要求：可重复、无外部依赖、零额外成本
+- Live Eval：有随机性（LLM 输出）、依赖 API key、产生费用
+
+Live Eval 的正确用途：Provider/模型升级时、Prompt 调整后、RC 发布前的统计门。
+
+---
+
+## Exact Ground Truth 匹配机制
+
+### Expected 定义
+
+```typescript
+interface ExpectedMemory {
+  category: MemoryCategory;        // 精确匹配
+  scope: MemoryScope;              // 精确匹配
+  titleIncludes: string[];         // title 包含所有 atom → 满足
+  contentIncludes: string[];       // content 包含所有 atom → 满足
+  evidenceIncludes: string;        // evidence 包含 atom → 满足
+  sourceEntryId: string;           // 精确匹配
+  // 额外要求：sessionId 存在、64-char sourceHash 存在
+}
+```
+
+### 匹配规则
+
+```
+对每条实际输出的 record：
+  对每条 expected：
+    如果 record.category === expected.category
+      && record.scope === expected.scope
+      && expected.titleIncludes 的所有 atom 都在 record.title 中
+      && expected.contentIncludes 的所有 atom 都在 record.content 中
+      && expected.evidenceIncludes 在 record.evidence 中
+      && record.provenance.sourceEntryId === expected.sourceEntryId
+      && record.provenance.sessionId 存在
+      && record.provenance.sourceHash 是 64 位 hex
+      → 匹配成功
+```
+
+### 双向一对一匹配
+
+```typescript
+// 不是简单的 for-for-if-match-count
+// 而是：
+// 1. 对每条 prediction，找最佳匹配的 expected
+// 2. 对每条 expected，标记是否已被匹配
+// 3. 不能一对多，不能多对一
+function evaluateRecords(testCase, records) {
+  const matchedRecords = new Set();
+  const matchedExpected = new Set();
+
+  for (const expected of testCase.expected) {
+    const match = records.find(r =>
+      !matchedRecords.has(r.id) && matches(r, expected)
+    );
+    if (match) {
+      matchedRecords.add(match.id);
+      matchedExpected.add(expected);
+    }
+  }
+
+  const TP = matchedExpected.size;
+  const FP = records.length - TP;           // 多出来的记录
+  const FN = testCase.expected.length - TP; // 没匹配上的 expected
+  // 还有 forbidden 检查：任何 record 包含 forbidden atom → 额外 FP
+}
 ```
 
 ---
 
-## 三、10 个 case 的维度和设计意图
+## Product Eval
 
-| # | Case | 测什么 | 为什么重要 |
-|---|------|--------|-----------|
-| 1 | basic-extraction | 4 种类型同时提取 | 验证基础能力——能不能从一个正常对话里提全 |
-| 2 | noise-rejection | 调试/闲聊 = 0 提取 | 验证不会把垃圾存成记忆 |
-| 3 | knowledge-recall | 知识声明必须提取 | 最重要的类型——Agent 不知道用户水平就没法对话 |
-| 4 | correction-signal | 纠正信号优先 | 用户纠正比普通对话更值得记住 |
-| 5 | discoverable-filter | 不存代码可发现信息 | 验证"Agent 读文件就知道的"不被存 |
-| 6 | cross-session-frequency | 频率跨会话累积 | 同一条信息在多次对话里出现应该增强 |
-| 7 | project-isolation | 项目 A 记忆不漏到 B | 验证项目隔离——这是 multi-project 场景的基础 |
-| 8 | edge-empty | 空对话 = 0 | 边界——不能从空对话提取幻觉 |
-| 9 | edge-multi-preference | 多个偏好合并 | 边界——Deep Sleep 允许合并相关偏好 |
-| 10 | edge-implicit-knowledge | 隐式知识声明 | 已知局限——评分公式对"写了好几年"这种隐式声明召回低 |
+Product Eval 不测内部日志或候选列表，只测用户可观察到的行为。
+
+| 模式 | 验证内容 |
+|---|---|
+| memory off | 系统 prompt 不含 Memory 索引 |
+| manual | SaveMemory 确认后，下一个 Session 的 before_agent_start 注入索引 |
+| async | runExtraction → review → consolidation → repository 后，最终 prompt 可见记忆 |
+
+关键：`visible` 字段来自真实的 prompt 命中，不是复制 expected 值。
 
 ---
 
-## 四、开发过程中的问题
+## 面试 Q&A
 
-### 问题 1：LLM 输出波动导致相同 case 不同结果
+**Q: 为什么 Eval 分三层而不是一个 test suite 全搞定？**
 
-**现象：** 同一个 transcript 跑两次，第一次 4/4 通过，第二次 3/4——少了一条 rule "禁止 git push"。
+> 因为验证的目标不同。确定性测试验证代码逻辑不依赖 LLM——改了 consolidation 逻辑后不用花钱调 API 就能知道对不对。Recorded Eval 验证整条 pipeline 接线——确保 extraction → review → repository 的数据流是通的。Live Eval 验证模型质量——测的是 LLM 在真实对话上的表现。混在一起的话，LLM 的随机性会污染确定性测试的结果。
 
-**排查：** LLM 温度设为 0.1，但仍有随机性。DeepSeek 的 temperature=0 也不能保证完全确定性输出。同一段 transcript，LLM 有时把 "禁止 git push" 识别为 rule，有时觉得它和上下文关联不够而跳过。
+**Q: Recorded Eval 100% F1 能说明什么？**
 
-**解决：** 给 minTotal 和 mustContain 加了 tolerance 参数（默认 1）。minTotal ≥ 4，tolerance=1 → 实际 ≥ 3 就通过。这样覆盖了 LLM 的正常波动，同时不会让显式的错误（0 提取）蒙混过关。
+> 只说明 pipeline 接线和确定性逻辑是正确的。不能说明 LLM 在实际使用中会表现好。类似于——你测试了水管没有漏水（Recorded），但没测试水源是不是干净的（Live）。
 
-**面试时怎么说：** > "跑 Eval 发现同一个 transcript 第一次 4 条全过，第二次少了 1 条。排查发现不是代码 bug——LLM 温度 0.1 仍有非确定性输出。我在断言里加了 tolerance=1，允许 1 条的波动。这不是放宽标准，是承认 LLM 非确定性并设计应对策略。"
+**Q: 为什么 Live Eval 要跑多轮（runs=3）？**
 
-### 问题 2：merge step 吞掉了 eval 的结果
+> LLM 输出有随机性（temperature > 0 时）。单次的 F1 可能是运气好或运气差。3 次可以报告 mean + variance + worst，能看到最差情况——在大厂场景中，最差情况的 F1 往往比平均 F1 更重要。
 
-**现象：** correction-signal case 在第一次跑时 3/3 通过，第二次跑完全相同的 transcript 变成了 0/3。提取器说"merged/updated: 3 | New to save: 0"。
+**Q: 为什么没有 coverage 目标（比如 80%）？**
 
-**排查：** 第二次跑时，第一次的提取结果已经保存在 `~/.triple-pi/memory/` 里了。Phase 3（Merge）看到相同的标题已经存在，就合并（merge）而不是新建（save）。eval 解析器只解析了 `✅ saved` 行，没解析 `🔗 merged` 行。
+> 行覆盖率是一个质量信号但不是目标。repository 的 archive/restore 路径、abort 路径、并发测试——这些都是关键路径但难以用覆盖率衡量。我们选择了关键路径全覆盖的策略（每个模块的核心行为都有 case），而不是追求覆盖率数字。
 
-**解决：** 两步：1) eval 用临时 HOME 目录（`eval/.eval-home/`），完全隔离于真实记忆存储。2) eval 解析器同时解析 `✅ saved` 和 `🔗 merged` 两种输出。
+**Q: 旧 Eval 最大的教训是什么？**
 
-**教训：** 测试环境隔离和测试数据隔离一样重要。Eval 不应该接触生产数据——不仅影响结果准确性，还可能误删用户数据。
-
-**面试时怎么说：** > "第一次跑全过，第二次全挂——排查发现是 Phase 3 的 merge 步骤看到已有记忆就直接合并，eval 解析器只看了新建的。修复是两件事：eval 用临时 HOME 目录隔离生产数据，解析器同时抓 saved 和 merged 行。这是测试基础设施问题，不是被测试代码的问题。"
-
-### 问题 3：隐式知识声明的评分盲区
-
-**现象：** edge-implicit-knowledge case 里用户说"TypeScript 写了好几年"（隐含 TS 熟练）和"Go 从来没写过"（隐含 Go 新手）。LLM 提取了 1 个候选，但评分 0.28，没过 0.35 阈值。
-
-**排查：** 隐式知识声明不像显式知识声明（"我读过 agent-loop.ts"）那样包含明确的 tech 关键词。"写了好几年"没有"agent-loop"、"Docker"这样的专有名词，relevance 得分很低（0.00-0.10）。加上只说一次（frequency 低），总分过不了 0.35。
-
-**当前处理：** 接受为已知局限。在 case 描述里标记"已知局限"，不要求通过。这会留在 eval 结果里提醒：隐式知识需要改进。
-
-**未来修复方向：** 给 knowledge 类型在 relevance 维度做特殊处理——不只看 tech 关键词，也看"写了好几年"、"没接触过"、"第一次做"这些经验描述的短语。或者让 Deep Sleep 的 prompt 里特别说明"隐式经验声明也是 knowledge"。
-
-**面试时怎么说：** > "有一个 case 专门测隐式知识——用户说'TS 写了好几年'但没说我熟练。LLM 能理解这是经验声明，但评分公式因为缺少 tech 关键词给了低分。我把它标为已知局限留在 eval 里。这种'系统能做什么、不能做什么'的诚实记录，比假装所有 case 都能过更有价值。"
-
-### 问题 4：discardable 事实的提取不稳定
-
-**现象：** discoverable-filter case 的核心测试是不该提取的（TypeScript 在 tsconfig.json、vitest 在 package.json）保证不出现。但"项目三个月后迁移 Go"这条应该提取的 fact，有时提取有时不提。
-
-**排查：** 和问题 1 一样——LLM 非确定性。Deep Sleep 有时认为"迁移 Go"的 evidence 不够明确而过滤它。
-
-**当前处理：** case 重点放在 mustNotContain（验证不该提的不提），mustContain 放宽接受波动。噪音拒绝比单条召回更重要——因为噪音多了会污染所有 case，但少一条 fact 只影响一个 case。
-
----
-
-## 五、当前结果
-
-| 指标 | 数据 |
-|------|------|
-| Case 数量 | 10 |
-| 覆盖维度 | 6（基础提取/噪音拒绝/knowledge 召回/纠正信号/可发现性/项目隔离） |
-| 边界 case | 3（空对话/多偏好/隐式知识） |
-| 当前通过率 | 10/10 |
-| 已知局限 | 1（隐式知识声明召回率低） |
-| 断言方式 | 代码验证（确定性，零 LLM-as-judge） |
-| 每次运行耗时 | ~60s（10 × 6s LLM 调用） |
-| 每次运行成本 | ~0.05 元（DeepSeek） |
-
----
-
-## 六、后续
-
-1. **稳定化** — 连续 5 次跑全部 10/10 才算真正稳定。目前 LLM 温度 0.1 有波动。
-2. **加更多边界 case** — 超长对话、纯代码粘贴、多语言混用。
-3. **基准对比** — 和不用 Deep Sleep 的版本对比通过率，量化 Deep Sleep 的价值。
-4. **真实数据回归** — 用你自己的几个典型 session 跑，人工标注后加入 eval suite。
+> 1. 不能只测"理想路径"——provider 失败、无 UI 环境这些异常路径必须覆盖。2. 指标要测对东西——category-only assertion 测的不是记忆质量。3. 负向测试同样重要——不仅要证明"该有的有了"，还要证明"不该有的没有"。4. 随机系统的测试结果不能用 tolerance 修饰——应该报告分布。

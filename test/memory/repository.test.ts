@@ -1,0 +1,195 @@
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { FilesystemMemoryRepository } from "../../extensions/memory/repository.ts";
+import { resolveProjectIdentity } from "../../extensions/memory/project-identity.ts";
+
+let tempDir: string;
+let repository: FilesystemMemoryRepository;
+const projectA = path.join(path.sep, "workspace", "project-a");
+const projectB = path.join(path.sep, "workspace", "project-b");
+
+beforeEach(async () => {
+  tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "triple-pi-memory-"));
+  repository = new FilesystemMemoryRepository({ root: tempDir });
+});
+
+afterEach(async () => {
+  await fs.rm(tempDir, { recursive: true, force: true });
+});
+
+describe("FilesystemMemoryRepository", () => {
+  it("isolates project memories and shares global memories", async () => {
+    await repository.save({
+      category: "rule",
+      scope: "project",
+      cwd: projectA,
+      title: "Project A Rule",
+      content: "Only project A may see this.",
+    });
+    await repository.save({
+      category: "preference",
+      scope: "global",
+      cwd: projectA,
+      title: "Global Preference",
+      content: "All projects may see this.",
+    });
+
+    expect((await repository.list(projectA)).map((entry) => entry.title)).toEqual([
+      "Global Preference",
+      "Project A Rule",
+    ]);
+    expect((await repository.list(projectB)).map((entry) => entry.title)).toEqual([
+      "Global Preference",
+    ]);
+  });
+
+  it("preserves createdAt when the same title is updated", async () => {
+    let current = new Date("2026-01-01T00:00:00.000Z");
+    repository = new FilesystemMemoryRepository({ root: tempDir, now: () => current });
+    const first = await repository.save({
+      category: "decision",
+      scope: "project",
+      cwd: projectA,
+      title: "API Style",
+      content: "Use REST.",
+    });
+    current = new Date("2026-01-02T00:00:00.000Z");
+    const updated = await repository.save({
+      category: "decision",
+      scope: "project",
+      cwd: projectA,
+      title: "API Style",
+      content: "Use GraphQL.",
+    });
+
+    expect(updated.id).toBe(first.id);
+    expect(updated.createdAt).toBe(first.createdAt);
+    expect(updated.updatedAt).toBe("2026-01-02T00:00:00.000Z");
+    expect((await repository.search("GraphQL", projectA))[0]?.record.content).toBe("Use GraphQL.");
+  });
+
+  it("rejects invalid runtime categories at the repository boundary", async () => {
+    await expect(repository.save({
+      category: "../../escape" as any,
+      scope: "project",
+      cwd: projectA,
+      title: "Bad category",
+      content: "Must not escape.",
+    })).rejects.toThrow("Invalid memory category");
+    expect(await repository.list(projectA)).toEqual([]);
+  });
+
+  it("keeps untrusted titles out of filesystem paths", async () => {
+    const record = await repository.save({
+      category: "fact",
+      scope: "project",
+      cwd: projectA,
+      title: "../../escape [link](file)",
+      content: "The title is data, not a path.",
+    });
+    const project = resolveProjectIdentity(projectA);
+    const expected = path.join(tempDir, "projects", project.id, "entries", "fact", `${record.id}.md`);
+
+    expect(await fs.readFile(expected, "utf8")).toContain("# ../../escape [link](file)");
+    await expect(fs.access(path.join(tempDir, "escape [link](file).md"))).rejects.toThrow();
+  });
+
+  it("rebuilds a deleted index from authoritative entry files", async () => {
+    await repository.save({
+      category: "knowledge",
+      scope: "project",
+      cwd: projectA,
+      title: "TypeScript Experience",
+      content: "Experienced with strict TypeScript.",
+    });
+    const project = resolveProjectIdentity(projectA);
+    const indexPath = path.join(tempDir, "projects", project.id, "MEMORY.md");
+    await fs.rm(indexPath);
+
+    await repository.rebuildIndex("project", projectA);
+    expect(await fs.readFile(indexPath, "utf8")).toContain("TypeScript Experience");
+  });
+
+  it("keeps healthy records available when one entry is damaged", async () => {
+    await repository.save({
+      category: "rule",
+      scope: "project",
+      cwd: projectA,
+      title: "Healthy Rule",
+      content: "This record remains available.",
+    });
+    const project = resolveProjectIdentity(projectA);
+    const damaged = path.join(tempDir, "projects", project.id, "entries", "rule", "damaged.md");
+    await fs.writeFile(damaged, "truncated", "utf8");
+
+    expect((await repository.list(projectA)).map((record) => record.title)).toEqual(["Healthy Rule"]);
+    expect((await repository.buildPrompt(projectA)).prompt).toContain("Healthy Rule");
+  });
+
+  it("reports a successful save when only the derived index cannot update", async () => {
+    const project = resolveProjectIdentity(projectA);
+    const base = path.join(tempDir, "projects", project.id);
+    await fs.mkdir(path.join(base, "MEMORY.md"), { recursive: true });
+
+    const record = await repository.save({
+      category: "fact",
+      scope: "project",
+      cwd: projectA,
+      title: "Authoritative Entry",
+      content: "The entry file is the source of truth.",
+    });
+
+    expect(record.title).toBe("Authoritative Entry");
+    expect((await repository.list(projectA)).map((entry) => entry.title)).toContain("Authoritative Entry");
+  });
+
+  it("does not let extraction create overwrite an existing manual record", async () => {
+    await repository.save({
+      category: "rule", scope: "project", cwd: projectA,
+      title: "Authoritative rule", content: "Manual authoritative value",
+    });
+    await expect(repository.saveExtractionBatch(projectA, "e".repeat(64), [{
+      category: "rule", scope: "project", title: "Authoritative rule",
+      content: "Unrelated extracted replacement", provenance: { source: "extraction" },
+    }])).rejects.toThrow("explicit replacement is required");
+    expect((await repository.search("Manual authoritative", projectA))).toHaveLength(1);
+  });
+
+  it("rejects unsafe or out-of-bound replacement record ids", async () => {
+    await expect(repository.saveExtractionBatch(projectA, "a".repeat(64), [{
+      category: "rule",
+      scope: "project",
+      title: "Unsafe replace",
+      content: "Must stay bounded.",
+      replaceRecordId: "../../escape",
+      provenance: { source: "extraction" },
+    }])).rejects.toThrow("Invalid replacement record ID");
+  });
+
+  it("increments reinforcement inside the repository lock", async () => {
+    await repository.saveExtractionBatch(projectA, "b".repeat(64), [], undefined, { "project:key": 1 });
+    await repository.saveExtractionBatch(projectA, "c".repeat(64), [], undefined, { "project:key": 1 });
+    expect((await repository.loadReinforcement(projectA))["project:key"].count).toBe(2);
+  });
+
+  it("serializes concurrent writers without losing entries", async () => {
+    await Promise.all(Array.from({ length: 20 }, (_, index) => repository.save({
+      category: "fact",
+      scope: "project",
+      cwd: projectA,
+      title: `Fact ${index}`,
+      content: `Content ${index}`,
+    })));
+
+    expect(await repository.list(projectA)).toHaveLength(20);
+    const project = resolveProjectIdentity(projectA);
+    const index = await fs.readFile(path.join(tempDir, "projects", project.id, "MEMORY.md"), "utf8");
+    expect(index.match(/^- \[/gm)).toHaveLength(20);
+  });
+
+  it("builds an empty prompt for a new project", async () => {
+    expect(await repository.buildPrompt(projectA)).toMatchObject({ prompt: "", count: 0 });
+  });
+});

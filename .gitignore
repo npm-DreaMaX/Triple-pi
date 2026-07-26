@@ -3,3 +3,7 @@ dist/
 .env
 eval/.eval-home/
 eval/results/
+.claude/
+coverage/
+*.log
+*.lock.tmp

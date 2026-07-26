@@ -1,15 +1,39 @@
 {
   "name": "triple-pi",
-  "version": "0.3.0",
-  "description": "Personal Coding Agent — Pi Runtime + OpenClaw-style async memory extraction",
+  "version": "1.0.0-rc.1",
+  "description": "Personal Coding Agent — Pi Runtime + project-scoped cross-session memory",
   "type": "module",
   "private": true,
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "scripts": {
-    "install-ext": "mkdir -p ~/.pi/agent/extensions && ln -sf $(pwd)/extensions/memory ~/.pi/agent/extensions/memory",
-    "extract": "node scripts/extract.mjs",
-    "cron:install": "node scripts/install-cron.mjs",
+    "install-ext": "node scripts/install-extension.mjs",
+    "extract": "node scripts/extract-disabled.mjs",
     "cron:remove": "node scripts/remove-cron.mjs",
-    "setup": "cd pi-runtime && npm install --ignore-scripts && npm run build && cd .. && npm run install-ext && npm run cron:install",
-    "eval": "node eval/runner.mjs"
+    "memory:status": "node --experimental-strip-types scripts/memory-status.mjs",
+    "memory:reset": "node scripts/memory-reset.mjs",
+    "memory:reset:dry-run": "node scripts/memory-reset.mjs --dry-run",
+    "build:pi": "npm --prefix pi-runtime install --ignore-scripts && npm --prefix pi-runtime run build",
+    "setup": "npm run build:pi && npm install && npm run install-ext && npm run memory:status",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "eval": "npm run eval:recorded",
+    "eval:recorded": "vitest run test/eval",
+    "eval:live": "node --experimental-strip-types eval/live-runner.ts",
+    "eval:legacy": "node eval/runner.mjs"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "file:./pi-runtime/packages/agent",
+    "@earendil-works/pi-ai": "file:./pi-runtime/packages/ai",
+    "@earendil-works/pi-coding-agent": "file:./pi-runtime/packages/coding-agent",
+    "proper-lockfile": "4.1.2"
+  },
+  "devDependencies": {
+    "@types/node": "24.12.4",
+    "@types/proper-lockfile": "4.1.4",
+    "typescript": "5.9.3",
+    "vitest": "4.1.9"
   }
 }
