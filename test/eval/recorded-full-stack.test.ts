@@ -52,7 +52,7 @@ function branch(user: string, assistant: string): SessionEntry[] {
 describe("recorded provider full-stack eval", () => {
   for (const testCase of EVAL_CASES) {
     it(testCase.id, async () => {
-      const recording = recordedOutput(testCase, "u1");
+      const recording = recordedOutput(testCase);
       const outputs = [JSON.stringify(recording.extraction)];
       if (recording.extraction.length > 0) outputs.push(JSON.stringify(recording.review));
       const { registry, calls } = recordedRegistry(outputs);
@@ -74,7 +74,11 @@ describe("recorded provider full-stack eval", () => {
       expect(calls).toHaveLength(recording.extraction.length > 0 ? 2 : 1);
       if (calls[1]) {
         expect(calls[1].systemPrompt).toContain("Review extracted coding-agent memories");
-        expect(calls[1].userText).toContain(testCase.user);
+        // Reviewer receives JSON with userMessages and candidates;
+        // the user message content is serialized inside so check a
+        // representative substring rather than the full multiline text.
+        const firstLine = testCase.user.split("\n")[0].slice(0, 40);
+        expect(calls[1].userText).toContain(firstLine);
       }
     });
   }

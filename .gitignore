@@ -7,3 +7,4 @@ eval/results/
 coverage/
 *.log
 *.lock.tmp
+*.jsonl

@@ -1410,9 +1410,9 @@ SQLite 的优势（事务、索引、查询）在记忆数量增长到成百上�
 
 | 层 | 命令 | 内容 | 特点 |
 |---|---|---|---|
-| 确定性测试 | `npm test` | 99 个 vitest 测试 | 无网络，mock 文件系统 |
-| Recorded Eval | `npm run eval:recorded` | 18 个 case，FIFO recorded provider | mock LLM，走完整 pipeline |
-| Live Eval | `npm run eval:live` | 真实 LLM 调用 | opt-in，需配置 model |
+| 确定性测试 | `npm test` | 112 个 vitest 测试 | 无网络，mock 文件系统 |
+| Recorded Eval | `npm run eval:recorded` | 10 个 case，FIFO recorded provider | mock LLM，走完整 pipeline |
+| Live Eval | `npm run eval:live` | 真实 LLM 调用 | opt-in，需配置 model，5 runs per case |
 
 ### 13.2 为什么 Recorded 不能证明模型质量？
 
@@ -1436,7 +1436,7 @@ Live Eval 才是测模型质量的——用真实模型、多轮运行、统计 
 # .github/workflows/ci.yml
 - npm ci --ignore-scripts
 - npm run typecheck
-- npm test  # 包含 99 个单元测试 + recorded eval
+- npm test  # 包含 112 个确定性测试 + recorded eval
 ```
 
 Live Eval 不进 CI——它依赖外部 API key、网络、成本、随机性。只用于发布前/模型升级时的统计验证。
@@ -1543,7 +1543,123 @@ Live Eval 不进 CI——它依赖外部 API key、网络、成本、随机性�
 
 ---
 
-## 15. 面试回答模板
+## 15. 已知技术问题与面试应答（必读）
+
+> 以下是当前系统真实存在的 6 个技术问题。GPT 和 Claude 都指出过。
+> 面试官如果追问到这些点，不要回避——承认、解释原因、说明为什么在当前场景下是可接受的取舍。
+
+### 问题 1：Record ID 与标题更新的矛盾
+
+**问题**：文档说 ID = SHA-256(scope + projectId + category + title)，又说"标题改成'用 TypeScript strict mode'后 ID 不变"。这两个说法矛盾——标题变了 hash 就变了，ID 必然变。
+
+**实际代码逻辑**：
+```typescript
+// domain.ts: 同标题重写 = 同 ID（save() 用于手动更新）
+recordId = SHA-256("project\0my-app\0rule\0使用 strict typescript")
+// ↑ title 是输入的一部分
+
+// 用户改标题 "使用 strict TypeScript" → ID 变了 → 新记录
+// consolidation.ts: 新记录通过 fingerprint/Jaccard 匹配到旧记录
+// 如果 correction=true → replace（保留旧 createdAt）
+// 如果普通重复 → skip
+```
+
+**面试应答**：
+> "ID 基于 title 生成，标题变了 ID 确实会变。这不是 bug，是两套机制的分工：save() 用来手动更新同标题记录——如果你再次保存 '使用 strict TypeScript'，ID 不变，内容覆盖。如果标题本身改了，靠 consolidation 层做去重和替换——semantic fingerprint + Jaccard ≥ 0.72 能找到旧记录，correction signal 触发 replace。ID 负责'精确匹配'，consolidation 负责'语义匹配'。两套机制互补。"
+
+### 问题 2：temp + rename ≠ 完整的崩溃持久性
+
+**问题**：文档把 temp+rename 描述得像是能防断电。实际上 `writeFile(temp) → rename(temp, target)` 只保证**可见性原子性**（其他进程读不到半写文件），不保证数据已经刷到磁盘。
+
+**更准确的表述**：
+```
+temp + rename:
+  ✅ 防止其他进程读取半写文件（原子可见性）
+  ✅ 防止写入中途崩溃导致正式文件损坏
+  ❌ 不保证断电后数据已持久化（需要 fsync）
+
+完整持久化需要:
+  writeFile(temp)
+  → fsync(temp)        // 强制刷到磁盘
+  → rename(temp, target)
+  → fsync(父目录)       // 确保目录元数据持久化
+```
+
+**面试应答**：
+> "temp + rename 提供的是文件替换的原子可见性——其他进程永远不会看到半写内容。对于本地 Coding Agent 的记忆系统，这个级别够了。最坏情况是突然断电丢失当次写入的一条记忆——对用户体验来说等于'这次没保存成功，下次重试'。加上 fsync 会增加延迟，对于几十 KB 的 Markdown 文件来说是过度工程。如果面试官追问，可以主动说'如果要做到 ACID 中的 D（Durability），需要 fsync 文件和父目录，这是下一步可以加强的点'。"
+
+### 问题 3：多文件"事务"实际是补偿事务
+
+**问题**：文档有时把 saveExtractionBatch 称为"事务"。但它的实现是逐个写文件 → 中途失败 → 用备份逐个恢复。这是**补偿事务（Compensating Transaction）**，不是 ACID 事务。
+
+**实际限制**：
+```
+✅ 正常失败路径：备份恢复有效
+❌ 进程在回滚中途崩溃 → 可能残留部分写入
+❌ 无锁读者可能看到批次中间状态
+❌ 没有 Write-Ahead Log（WAL）
+❌ 没有单一原子提交点
+```
+
+**面试应答**：
+> "单个文件用 temp+rename 保证原子性。跨多个文件的批次用的是补偿事务——先备份，逐个写入，失败后逐文件恢复。我承认这不是数据库级的 ACID 事务：如果进程在回滚执行到一半时再次崩溃，可能残留部分写入。但有三重保护：一，残留的 entry 有 sourceHash manifest 做幂等过滤，不会被重复处理；二，entry 是独立文件，残留一个不影响其他；三，索引可从 entry 重建。对于本地记忆系统，数据完整性风险在可接受范围内。如果未来要做企业级多进程部署，应该引入 Write-Ahead Journal 或者 snapshot 目录 + 原子切换 current 指针。"
+
+### 问题 4：Prompt Budget 混用了 Token 和字符
+
+**问题**：代码用 `ctx.model?.contextWindow` 做字符预算，但 contextWindow 通常是 token 数，字符和 token 不是 1:1 的。
+
+```typescript
+// index.ts: before_agent_start
+const contextWindow = ctx.model?.contextWindow || 32_000;
+const workingCharBudget = Math.floor(contextWindow * 0.2);  // ← 假设 token == char
+const memoryCharBudget = Math.floor(contextWindow * 0.3);
+```
+
+实际情况：
+```
+英文: 1 token ≈ 4 字符
+中文: 1 token ≈ 1-2 字符
+代码: 1 token ≈ 3-5 字符
+```
+
+**面试应答**：
+> "当前实现把 context window 的 token 数直接当字符数做预算，我清楚这个近似不精确。但它的错误方向是保守的——token 上限通常比字符上限大（1 token ≈ 4 英文字符），用字符做上限只会注入得更少，不会溢出 context window。加入 tokenizer 做精确截断是更好的方案，但会引入额外依赖和复杂度。当前取舍是'用简单实现保证不越界'。"
+
+### 问题 5：evidence 存在 ≠ content 被 evidence 支撑
+
+**问题**：当前严格验证了 evidence 是 user message 的逐字子串，但没验证 content 完全被 evidence 蕴含。LLM 可以提取一小段引用作为 evidence，但写出一大段推断作为 content。
+
+```
+✅ 已验证: evidence "使用 JWT" 在 user 原文中存在
+❌ 未验证: content "所有服务必须永久使用 JWT，且禁止任何其他认证协议"
+          是否真的被 evidence 蕴含，还是 LLM 自己推断的
+```
+
+**面试应答**：
+> "当前保证的是'引用真实存在'，不是'正文被引用完全蕴含'。这个 gap 我清楚。做 entailment checking 需要另一个 judge LLM 判断 evidence 是否逻辑蕴含 content，这本身有准确率问题，而且成本翻倍。当前的缓解措施：一，extraction prompt 要求 content 尽量接近 evidence 原句；二，reviewer 能看到完整 user message 上下文，能识别明显的过度推断；三，用户手动 SaveMemory 是最终的 truth source。更严格的方案可以作为后续迭代方向。"
+
+### 问题 6：缺少运行数据（最关键的缺失）
+
+**问题**：系统有 112 个确定性测试和 recorded eval，但没有真实 LLM 的运行指标。面试时如果有人问"提取成功率多少、false positive rate 多少"，目前只能回答"还没测"。
+
+**需要的数据**：
+```
+提取成功率（pipeline 正常执行的比例）
+Candidate Precision（保存的记忆中有多少是正确的）
+Candidate Recall（应该提取的有多少被提取）
+False Positive Rate（不该保存的有多少被保存）
+Noise Rejection Accuracy（噪声 case 的正确拒绝率，expected=0 且 predicted=0）
+F1（综合）
+Reviewer 过滤后的 Precision 变化（有/无 reviewer 对比）
+平均延迟和 Token 消耗
+```
+
+**面试应答**：
+> "确定性测试验证了 pipeline 接线和逻辑正确性。Live Eval 是 opt-in 的——支持 10 个 case × 5 runs，输出 mean F1 / variance / worst F1 / FP rate，以及 noise rejection accuracy 和 per-case breakdown。报告会自动记录模型名、commit SHA、Node 版本和 reviewer 开关状态。需要注意：noise case 的 expected=0 且 predicted=0 时，指标显示 noiseRejected=true 而不是 precision=1.0——避免 0/0 分母的歧义。Recorded reviewer comparison 验证了过滤链路和指标计算逻辑；真实 reviewer 效果由 Live Eval 的 reviewer-on/off 对照来验证。"
+
+---
+
+## 16. 面试回答模板
 
 ### 开场（30秒）
 
@@ -1559,7 +1675,7 @@ Live Eval 不进 CI——它依赖外部 API key、网络、成本、随机性�
 
 ### 亮点（30秒）
 
-> "最大的亮点是 grounding——自动记忆的风险在于 LLM 幻觉，我用 evidence 逐字校验 + reviewer 禁止改写 + 事务性写入三层保证每一条记忆都有对话原文支撑。测试分三层：99 个确定性单元测试做 CI 门，18 个 recorded case 验证接线，live LLM eval 独立测模型质量。"
+> "最大的亮点是 grounding——自动记忆的风险在于 LLM 幻觉，我用 evidence 逐字校验 + reviewer 禁止改写 + 事务性写入三层保证每一条记忆都有对话原文支撑。测试分三层：112 个确定性单元测试做 CI 门，10 个 recorded case 验证接线，live LLM eval 独立测模型质量。"
 
 ### 主动提限制（15秒）
 

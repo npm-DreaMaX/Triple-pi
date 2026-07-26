@@ -8,6 +8,10 @@ export interface EvalMetrics {
   precision: number;
   recall: number;
   f1: number;
+  /** true 当 expected=0 且 predicted=0 时——表示噪声被正确拒绝 */
+  noiseRejected: boolean;
+  /** 当 precision 因分母为零而无法计算时为 true */
+  precisionUndefined: boolean;
   failures: string[];
 }
 
@@ -61,8 +65,21 @@ export function evaluateRecords(testCase: EvalCase, records: MemoryRecord[]): Ev
     }
   }
 
-  const precision = truePositive + falsePositive === 0 ? (testCase.expected.length === 0 ? 1 : 0) : truePositive / (truePositive + falsePositive);
+  // ── 指标计算 ──
+  // 当 TP+FP=0（无预测）且 expected=0（无期望）时：
+  //   噪声被完美拒绝，但 precision 在数学上未定义（0/0）。
+  //   我们设置 noiseRejected=true，并将 precision/recall/f1 设为 1
+  //   以表示"该 case 通过"，但面试时必须明确说明这是 noise rejection，
+  //   不是分类 precision。
+  const precisionUndefined = truePositive + falsePositive === 0 && testCase.expected.length === 0;
+  const precision = truePositive + falsePositive === 0
+    ? (testCase.expected.length === 0 ? 1 : 0)
+    : truePositive / (truePositive + falsePositive);
   const recall = testCase.expected.length === 0 ? 1 : truePositive / testCase.expected.length;
   const f1 = precision + recall === 0 ? 0 : 2 * precision * recall / (precision + recall);
-  return { truePositive, falsePositive, falseNegative, precision, recall, f1, failures };
+  const noiseRejected = testCase.expected.length === 0 && truePositive === 0 && falsePositive === 0;
+  return {
+    truePositive, falsePositive, falseNegative, precision, recall, f1,
+    noiseRejected, precisionUndefined, failures,
+  };
 }

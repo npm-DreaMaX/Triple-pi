@@ -26,16 +26,18 @@ function branch(user: string, assistant: string): SessionEntry[] {
 
 describe("recorded current-pipeline eval", () => {
   for (const testCase of EVAL_CASES) {
-    it(testCase.id, async () => {
-      const recorded = recordedOutput(testCase, "u1");
+    it(`${testCase.id}: ${testCase.description}`, async () => {
+      const recorded = recordedOutput(testCase);
       provider.extractCandidateJson.mockResolvedValueOnce(JSON.stringify(recorded.extraction));
-      reviewer.reviewCandidates.mockResolvedValueOnce(recorded.extraction);
-      const repository = new FilesystemMemoryRepository({ root });
+      reviewer.reviewCandidates.mockResolvedValueOnce(recorded.extraction.map((c) => ({ ...c, action: "keep", reason: "recorded" })));
+
+      const repository = new FilesystemMemoryRepository({ root: pathJoin(root, testCase.id) });
       await runExtraction(repository, {
         cwd: testCase.cwd, sessionId: `session-${testCase.id}`, branch: branch(testCase.user, testCase.assistant),
         branchLeafId: "a1", model: { provider: "recorded" } as any, modelRegistry: {} as any,
       }, new AbortController().signal);
-      const records = (await repository.list(testCase.cwd)).filter((record) => record.provenance.sessionId === `session-${testCase.id}`);
+
+      const records = (await repository.list(testCase.cwd)).filter((r) => r.provenance.sessionId === `session-${testCase.id}`);
       const metrics = evaluateRecords(testCase, records);
       expect(metrics.failures).toEqual([]);
       expect(metrics.f1).toBe(1);
@@ -50,3 +52,7 @@ describe("recorded current-pipeline eval", () => {
     expect((await repository.search("B only", "/eval/A"))).toEqual([]);
   });
 });
+
+function pathJoin(...parts: string[]): string {
+  return parts.join("/");
+}
