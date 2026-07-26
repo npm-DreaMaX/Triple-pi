@@ -922,7 +922,7 @@ async function extractCandidateJson({ model, modelRegistry, messages, signal }):
   // 1. 获取认证信息（复用用户的 API key、base URL、custom headers）
   const auth = await modelRegistry.getApiKeyAndHeaders(model);
 
-  // 2. 获取 Provider 实例（OpenAI / Anthropic / custom 等）
+  // 2. 获取 Provider 实例
   const provider = modelRegistry.getProvider(model.provider);
 
   // 3. 发送提取请求
@@ -947,7 +947,7 @@ async function extractCandidateJson({ model, modelRegistry, messages, signal }):
 
 **关键设计——复用 Pi 的认证体系**：
 - 不自己读 `auth.json`
-- 不通过 API key 前缀猜 Provider（`sk-` → OpenAI, `sk-ant-` → Anthropic）
+- 不通过 API key 前缀猜 Provider（不同 provider 的 key 前缀不同）
 - 不硬编码 endpoint URL
 - 完全复用 Pi 的 `ModelRegistry.getApiKeyAndHeaders()` 和 `getProvider()`
 - 支持 OAuth、custom provider、dynamic base URL 等所有 Pi 支持的认证方式
@@ -1521,7 +1521,7 @@ Live Eval 不进 CI——它依赖外部 API key、网络、成本、随机性�
 
 **Q17: 为什么 Send to LLM 之前要做 redaction？**
 
-> 对话内容会被发送到 LLM Provider 的服务器（OpenAI/Anthropic 等）。如果对话里包含了 API key 或 token，相当于把 secret 发给了第三方。Redaction 在发送前把匹配的内容替换为 `[REDACTED_SECRET]`，LLM 收到的是已脱敏的文本。
+> 对话内容会被发送到 LLM Provider 的服务器。如果对话里包含了 API key 或 token，相当于把 secret 发给了第三方。Redaction 在发送前把匹配的内容替换为 `[REDACTED_SECRET]`，LLM 收到的是已脱敏的文本。
 
 **Q18: SaveMemory 为什么需要代码级确认而不是依赖 prompt 指令？**
 

@@ -694,7 +694,7 @@ CI 应可重复、无外部凭证、无随机成本。Live Eval 是发布前/模
 - Pi submodule 固定且干净；
 - 根 MIT LICENSE；
 - legacy cron 不再安装，移除脚本只匹配历史 canonical entry/marker；
-- `.claude`、coverage、logs 和临时 lock artifacts 不进入发布。
+- coverage、logs 和临时 lock artifacts 不进入发布。
 
 ### 11.5 Block 7 面试问题
 

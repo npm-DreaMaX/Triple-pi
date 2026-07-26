@@ -166,14 +166,14 @@ knowledge:         "I have never used Rust..." → 提取出 knowledge
 **使用方式**：
 ```bash
 # 必须显式指定 model 和 runs
-TRIPLE_PI_EVAL_MODEL=anthropic/claude-sonnet-5
+TRIPLE_PI_EVAL_MODEL=provider/model-name
 TRIPLE_PI_EVAL_RUNS=3
 npm run eval:live
 ```
 
 **报告内容**：
 ```
-Model: anthropic/claude-sonnet-5
+Model: provider/model-name
 Runs: 3
 Extractor version: 1
 
