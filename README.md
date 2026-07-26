@@ -1,35 +1,67 @@
 # Triple-pi
 
-基于 [Pi Agent Runtime](https://github.com/earendil-works/pi) 的项目隔离、跨 Session Coding Agent Memory Extension。
+Coding Agent 扩展系统，基于 [Pi Agent Runtime](https://github.com/earendil-works/pi)。
 
-**不修改 Pi Runtime 源码。** Memory 通过 Pi Extension lifecycle、tool system、session tree 和 ModelRegistry 接入。
+**不修改 Pi Runtime 源码。** 通过 Pi Extension lifecycle、SDK Agent Session、tool system 和 ModelRegistry 接入。
 
-## 当前状态
+两个模块：
 
-版本：`1.0.0-rc.1`
+- **Persistent Memory** — 跨 Session 项目记忆，可信保存项目规则、偏好、决策
+- **Reviewer SubAgent** — 独立只读代码审查，自动 git diff + Memory 检索
 
-已实现并经过确定性测试：
+## 运行状态
 
-- global + per-project 长期记忆
-- SaveMemory 写入前用户确认
-- 新 Session 在第一次模型请求前召回
-- 30 天冷态恢复确认、90 天无损归档
-- 当前 branch 的异步提取和 branch-local checkpoint
-- Pi 原生 Provider/Auth/OAuth/custom-provider 路径
-- user-only evidence、secret redaction、Grounded Review
-- correction、project-scoped reinforcement、确定性 consolidation
-- Scratchpad + 按日 Daily Working State
-- recorded/full-stack/live/product 三层 Eval
+| 指标 | 值 |
+|---|---|
+| 确定性测试 | 21 文件 / 152 测试 |
+| Recorded Eval | 10 cases / 全通过 |
+| Live Eval | deepseek-v4-flash × 3 runs × 10 cases |
+| typecheck | 通过 |
 
-完整重做过程、工程取舍、验收数据和面试问答见 [MEMORY_REBUILD.md](./MEMORY_REBUILD.md)。
+### Live Eval 结果（deepseek/deepseek-v4-flash）
+
+```
+Mean F1:       0.73
+Precision:     0.73
+Recall:        0.74
+FP Rate:       27%
+Pipeline Rate: 100% (30/30)
+Avg Latency:   2,533ms
+P95 Latency:   3,962ms
+```
+
+稳定通过的 case：project-rule、global-preference、correction、noise-only、implicit-convention、code-constraint
+
+不稳定 case：knowledge（category 归类错误）、mixed-noise（噪声误提取）、chinese-convention、multi-rule
+
+> 这是真实数据，不是美化后的数字。knowledge/mixed-noise 的不稳定性反映了 DeepSeek V4 Flash 在细粒度分类和噪声过滤上的能力边界。
+
+## 架构
+
+```
+Pi Agent Runtime
+    │
+    ├── Memory Extension
+    │   ├── SaveMemory / SearchMemory tools
+    │   ├── agent_settled → 自动提取管线
+    │   │   ├── secret redaction
+    │   │   ├── LLM extraction
+    │   │   ├── strict validation (evidence 逐字校验)
+    │   │   ├── Grounded Review (keep/remove only)
+    │   │   └── deterministic consolidation
+    │   ├── before_agent_start → 记忆注入
+    │   └── 生命周期: hot(30d) / cold(90d) / archive
+    │
+    └── SubAgent Extension
+        ├── delegate_review — 手动审查
+        └── review_current_changes — 自动 git diff + Memory 检索 → Reviewer
+            ├── createAgentSession (独立 in-memory session)
+            ├── tools: [read, grep, find, ls] (只读白名单)
+            ├── Promise.race 硬超时
+            └── 结构化 ReviewResult
+```
 
 ## 安装
-
-要求：
-
-- Node.js `>=22.19.0`
-- Git submodule
-- 至少一个通过 Pi 配置可用的模型
 
 ```bash
 git clone --recurse-submodules https://github.com/npm-DreaMaX/Triple-pi.git
@@ -37,179 +69,57 @@ cd Triple-pi
 npm run setup
 ```
 
-`setup` 会：
+要求 Node.js `>=22.19.0`。
 
-1. 构建本仓库固定版本的 Pi Runtime；
-2. 安装根依赖；
-3. 将 `extensions/memory` 安装为 `~/.pi/agent/extensions/memory` symlink；
-4. 运行只读 Memory 自检。
-
-它**不会**安装 cron、删除旧数据或自动运行 Live Eval。
-
-如果 `~/.pi/agent/extensions/memory` 已是普通文件/目录，安装器会拒绝覆盖。
-
-## 启动 Pi
+## 测试
 
 ```bash
-cd pi-runtime
-./pi-test.sh
+npm run typecheck    # 类型检查
+npm test             # 152 确定性测试
+npm run eval:recorded # 10 recorded case
 ```
 
-通过 Pi 的 `/login` 或 Pi 支持的环境变量配置 Provider。Triple-pi 不直接读取 `auth.json`、不猜 Provider，也不把其他 Provider 的 key 发往错误 endpoint。
+Live Eval（opt-in，需 API key）：
 
-## Memory 行为
-
-### 手动保存
-
-用户明确要求“记住”时，Agent 可调用 `SaveMemory`。每次写盘前 Pi UI 会展示完整 scope/category/title/content，并要求用户确认。无交互 UI 时默认拒绝写入。
-
-### 自动提取
-
-在 `agent_settled` 后异步执行：
-
-```text
-current branch delta
-→ secret redaction
-→ extraction
-→ strict user evidence validation
-→ Grounded Review
-→ correction/reinforcement/consolidation
-→ transactional repository commit
-→ branch-local checkpoint
+```bash
+TRIPLE_PI_EVAL_MODEL=deepseek/deepseek-v4-flash TRIPLE_PI_EVAL_RUNS=5 npm run eval:live
 ```
-
-只处理当前 session tree branch，不扫描或猜测“最新 JSONL”。
-
-### 生命周期
-
-| 闲置时间 | 行为 |
-|---|---|
-| 0–30 天 | hot：正常注入和搜索 |
-| >30–90 天 | cold：再次打开时询问是否恢复 |
-| >90 天 | 自动移动到 archive，不删除 |
-
-归档记忆默认不进入 prompt 或普通搜索，可使用 `/memory-restore` 恢复，或 `SearchMemory(includeArchived=true)` 显式查询。
-
-### Working State
-
-```text
-projects/<project-id>/working/sessions/<session-hash>/SCRATCHPAD.md
-projects/<project-id>/daily/YYYY-MM-DD.md
-```
-
-Working State 是临时进度数据，不属于长期 Memory，不参与长期 consolidation。SearchMemory 只有显式 `scope=working` 才查询它。
 
 ## 存储
 
-默认根目录：
-
-```text
+```
 ~/.triple-pi/memory-v1/
-├── global/entries/
-├── projects/<project-id>/
-│   ├── entries/
-│   ├── MEMORY.md
-│   ├── project.json
-│   ├── working/
-│   └── daily/
-├── archive/projects/
-├── extractions/
-├── signals/
-└── working-manifests/
+├── global/entries/          ← 跨项目共享
+├── projects/<id>/entries/   ← 项目隔离
+├── projects/<id>/working/   ← Scratchpad
+├── projects/<id>/daily/     ← 按日时间线
+├── archive/                 ← 无损归档
+├── extractions/             ← 幂等 manifest
+└── signals/                 ← reinforcement
 ```
 
-Entry Markdown 是权威数据，`MEMORY.md` 是可重建索引。目录权限为 0700，文件为 0600；写入使用 repository lock 和 temp+rename。
+## 关键设计决策
 
-旧 `~/.triple-pi/memory/` 不迁移、不读取。
-
-## 运维
-
-### 状态检查
-
-```bash
-npm run memory:status
-npm run memory:status -- --cwd=/path/to/project
-```
-
-输出 extension 安装状态、schema、project ID、hot/cold/archive、条目数、manifest 数和 root mode；不输出 Memory 正文。
-
-Pi 内也可使用：
-
-```text
-/memory-status
-/memory-archive
-/memory-restore
-```
-
-### Reset
-
-先查看目标：
-
-```bash
-npm run memory:reset:dry-run
-```
-
-交互确认删除：
-
-```bash
-npm run memory:reset
-```
-
-自动化环境必须显式授权：
-
-```bash
-npm run memory:reset -- --yes
-```
-
-默认 Reset 只将当前项目的 active/archive、extraction manifest、signals 和 working manifests 移入 quarantine。`--scope=all` 处理整个 canonical root，`--scope=legacy` 处理旧 root；都不删除 Pi sessions、auth 或 Extension 安装。Quarantine 不会自动 purge。
-
-旧版本安装过 cron 时，可显式移除：
-
-```bash
-npm run cron:remove
-```
-
-## 测试与 Eval
-
-```bash
-npm run typecheck
-npm test
-npm run eval:recorded
-```
-
-Live Eval 是显式 opt-in：
-
-```bash
-TRIPLE_PI_EVAL_MODEL=provider/model \
-TRIPLE_PI_EVAL_RUNS=3 \
-npm run eval:live
-```
-
-- deterministic/recorded：无网络，作为 CI 门
-- live：真实模型统计，不进入 CI
-- product：memory off/manual/async 的用户可观察行为对照
-- legacy：`npm run eval:legacy` 仅供历史分析，不是发布信号
-
-## 数据与安全边界
-
-- 自动提取会把经过 secret redaction 的当前 branch 文本发送给当前 Pi 模型 Provider。
-- 提取和 Review 都复用当前 Provider/Auth/Base URL/headers/env。
-- 常见 API key、GitHub PAT、AWS key、JWT、Bearer、Slack token、private key 和 password assignment 会在发送前脱敏，并在模型输出后再次检测。
-- Secret 检测不能保证覆盖所有私有格式；处理敏感代码库前应确认 Provider 与组织政策。
-- 没有向量数据库；本地 Markdown 优先保证审计、恢复和零运维。
+- **Evidence grounding**: 自动提取的 evidence 必须是 user message 逐字子串，LLM 不能编证据
+- **Fail-closed**: 无 UI 拒绝写入，malformed 输出整批拒绝，归档项目拒绝写入
+- **Precision over Recall**: 宁可漏存（下次可重试），不能存错（跨 session 污染）
+- **CWD isolation**: 不同项目目录独立隔离，不用 git remote（避免 monorepo 污染）
+- **原子写入**: temp + rename 保证文件级原子可见性
+- **Reviewer 工具白名单**: 代码级 `tools: ["read","grep","find","ls"]`，不是 prompt 约束
 
 ## 当前限制
 
-- 当前 correction 只自动替换同 scope/category 的确定性高相似目标；模糊冲突保守地保留为独立记录。
-- Working State 是最近 user/assistant 的确定性投影，不是完整任务规划器。
-- Live Eval 需要用户明确选择模型和凭证。
-- Release candidate 尚未执行真实企业多进程长期 soak test。
+- 知识类记忆（knowledge category）在不同模型上分类不一致
+- 噪声过滤依赖 reviewer 质量，长对话中可能误提取
+- 没有向量检索（当前规模下子字符串搜索够用）
+- Secret redaction 基于正则，不覆盖组织自定义格式
+- 缺少多开发者共享和企业级 soak test
 
 ## 文档
 
-- [MEMORY_REBUILD.md](./MEMORY_REBUILD.md)：逐 Block 重做、问题证据、设计决策、验收与面试问答
-- [INTERVIEW_MEMORY.md](./INTERVIEW_MEMORY.md)：历史 Memory 设计文档；以重做文档和当前代码为准
-- [INTERVIEW_EVAL.md](./INTERVIEW_EVAL.md)：历史 Eval 设计文档；旧“10/10”不再作为当前质量信号
+- [INTERVIEW_MEMORY.md](./INTERVIEW_MEMORY.md) — 面试完整指南（基础概念、架构、QA、回答模板）
+- [INTERVIEW_EVAL.md](./INTERVIEW_EVAL.md) — Eval 面试指南
+- [MEMORY_REBUILD.md](./MEMORY_REBUILD.md) — 设计决策和验收记录
 
 ## License
 

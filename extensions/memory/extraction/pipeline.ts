@@ -67,9 +67,13 @@ function plainObject(value: unknown): value is Record<string, unknown> {
 }
 
 export function validateCandidates(raw: string, source: ExtractionSource): ExtractedCandidate[] {
+  // Strip markdown fences — some models wrap JSON output
+  const stripped = raw.trim().startsWith("```")
+    ? raw.trim().replace(/^```(?:json)?\s*\n?/, "").replace(/\n?```\s*$/, "")
+    : raw;
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
+    parsed = JSON.parse(stripped);
   } catch {
     throw new CandidateValidationError("Extraction output is not valid JSON");
   }

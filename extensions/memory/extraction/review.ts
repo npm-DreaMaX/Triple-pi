@@ -66,8 +66,10 @@ export async function reviewCandidates(input: {
   ).result();
   if (response.stopReason !== "stop") throw new Error(response.errorMessage || `Memory review stopped: ${response.stopReason}`);
   const raw = response.content.filter((item) => item.type === "text").map((item) => item.text).join("\n").trim();
+  // Strip markdown fences — some models (DeepSeek, etc.) wrap JSON in ``` fences
+  const stripped = raw.startsWith("```") ? raw.replace(/^```(?:json)?\s*\n?/, "").replace(/\n?```\s*$/, "") : raw;
   let parsed: unknown;
-  try { parsed = JSON.parse(raw); } catch { throw new Error("Memory review output is not valid JSON"); }
+  try { parsed = JSON.parse(stripped); } catch { throw new Error("Memory review output is not valid JSON"); }
   if (!Array.isArray(parsed) || parsed.length !== input.candidates.length) throw new Error("Memory review result count mismatch");
 
   const userMessages = new Map(input.source.messages.filter((message) => message.role === "user").map((message) => [message.entryId, message.content]));
