@@ -13,9 +13,9 @@ Coding Agent 扩展系统，基于 [Pi Agent Runtime](https://github.com/earendi
 
 | 指标 | 值 |
 |---|---|
-| 确定性测试 | 21 文件 / 152 测试 |
+| 自动化测试 | 21 文件 / 152 tests（Memory 74 + Working 7 + Eval 23 + SubAgent 20 + Scripts 28） |
 | Recorded Eval | 10 cases / 全通过 |
-| Live Eval | deepseek-v4-flash × 3 runs × 10 cases |
+| Live Eval | deepseek-v4-flash, 10 cases × 3 runs = 30 observations |
 | typecheck | 通过 |
 
 ### Live Eval 结果
@@ -85,7 +85,7 @@ npm run setup
 
 ```bash
 npm run typecheck    # 类型检查
-npm test             # 152 确定性测试
+npm test             # 152 自动化测试
 npm run eval:recorded # 10 recorded case
 ```
 
