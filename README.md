@@ -18,23 +18,33 @@ Coding Agent 扩展系统，基于 [Pi Agent Runtime](https://github.com/earendi
 | Live Eval | deepseek-v4-flash × 3 runs × 10 cases |
 | typecheck | 通过 |
 
-### Live Eval 结果（deepseek/deepseek-v4-flash）
+### Live Eval 结果
 
-```
-Mean F1:       0.73
-Precision:     0.73
-Recall:        0.74
-FP Rate:       27%
-Pipeline Rate: 100% (30/30)
-Avg Latency:   2,533ms
-P95 Latency:   3,962ms
-```
+| 条件 | 值 |
+|---|---|
+| 模型 | deepseek/deepseek-v4-flash |
+| Cases | 10 |
+| Runs per case | 3 |
+| 总观测数 | 30 |
+| Commit | 3498dbd |
 
-稳定通过的 case：project-rule、global-preference、correction、noise-only、implicit-convention、code-constraint
+| 指标 | 值 |
+|---|---|
+| Mean F1 | 0.73 |
+| Worst F1 | 0.0（knowledge/mixed-noise） |
+| Best F1 | 1.0（6/10 cases） |
+| Mean Precision | 0.73 |
+| Mean Recall | 0.74 |
+| Pipeline Success Rate | 100%（30/30 提取完成） |
+| False Positive Rate | 27% |
+| Avg Latency | 2,533ms |
+| P95 Latency | 3,962ms |
 
-不稳定 case：knowledge（category 归类错误）、mixed-noise（噪声误提取）、chinese-convention、multi-rule
+**稳定通过**（3/3 全对）：project-rule、correction、noise-only、implicit-convention、code-constraint
 
-> 这是真实数据，不是美化后的数字。knowledge/mixed-noise 的不稳定性反映了 DeepSeek V4 Flash 在细粒度分类和噪声过滤上的能力边界。
+**不稳定**：knowledge（category 归类为 fact 而非 knowledge）、mixed-noise（噪声误提取为规则）、chinese-convention（category 归类不一致）、multi-rule（部分规则遗漏）
+
+> 这是 Pilot Eval，10 cases × 3 runs 是小规模统计，不能宣称生产级准确率。knowledge 和 mixed-noise 的失败反映了 DeepSeek V4 Flash 在细粒度分类和噪声过滤上的边界。
 
 ## 架构
 
