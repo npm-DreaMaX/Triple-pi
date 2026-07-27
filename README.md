@@ -72,23 +72,51 @@ The agent memory and code review space is full of demos that work in a 5-minute 
 
 ## Install
 
+Node.js `>=22.19.0` required. Uses [Pi](https://github.com/earendil-works/pi) as the agent runtime.
+
 ```bash
 git clone --recurse-submodules https://github.com/npm-DreaMaX/Triple-pi.git
 cd Triple-pi
 npm run setup
 ```
 
-Node.js `>=22.19.0`. Uses [Pi](https://github.com/earendil-works/pi) as the agent runtime.
+`npm run setup` builds Pi, installs the extension, and links the `trip` command to `~/.local/bin/` (Linux/macOS). On Windows, add `bin\` to your PATH manually.
 
-After setup, start Pi as usual. Triple-pi's tools (`SaveMemory`, `SearchMemory`, `review_current_changes`) are loaded automatically — no separate command, no separate process.
+### Platform notes
+
+| | Linux | macOS | Windows |
+|---|---|---|---|
+| Shell | `trip` | `trip` | `trip.bat` or `trip.ps1` |
+| Launcher path | `~/.local/bin/trip` | `~/.local/bin/trip` | `<repo>\bin\trip.bat` |
+| Restart shell if `trip` not found | `source ~/.zshrc` | `source ~/.zshrc` | restart terminal |
+
+## Usage
+
+```bash
+trip
+```
+
+Triple-pi's tools are loaded automatically — `SaveMemory`, `SearchMemory`, `review_current_changes`. No separate command, no separate process.
+
+## Usage
+
+After setup, run from any directory:
+
+```bash
+trip
+```
+
+Triple-pi's tools are loaded automatically — `SaveMemory`, `SearchMemory`, `review_current_changes`.
+
+`trip` is linked to `~/.local/bin/` during setup. If `trip` isn't found, restart your shell or add `~/.local/bin` to your PATH.
 
 ## Verify
 
 ```bash
 npm run typecheck
-npm test               # 178 tests, 0 network, 0 LLM
-npm run eval:recorded   # 46 full-pipeline tests
-npm run demo            # Offline smoke test
+npm test
+npm run eval:recorded
+npm run demo
 ```
 
 ---

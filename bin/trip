@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Triple-pi launcher — run this from any directory.
+# Wraps the Pi agent runtime with Triple-pi's Memory and Reviewer extensions loaded.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+exec "$REPO_ROOT/pi-runtime/pi-test.sh" "$@"
