@@ -10,59 +10,63 @@ Persistent memory and project-aware code review for coding agents.
 
 ## What it does
 
-Two modules that share one memory store.
-
 ### Persistent Memory
 
-The agent forgets everything between sessions. You re-explain conventions, re-state preferences, re-teach decisions. Triple-pi remembers for it.
+Coding agents forget everything between sessions. You re-explain conventions. You re-state preferences. You catch the same mistakes. Triple-pi remembers.
 
-After each conversation, the system extracts what's worth keeping — rules, preferences, technical decisions — and saves them. Next time you open the project, the agent loads them automatically.
+After each conversation, the system extracts rules, preferences, and technical decisions — then saves them. Next session, the agent loads them automatically.
 
-What you get in practice:
-
-- Agent learns "this project uses pino, not console.log." It sticks.
-- You say "actually, use GraphQL instead of REST." The old rule is replaced, not duplicated.
-- You open a project you haven't touched in 35 days. The agent asks: "Restore project memory?" Your choice.
-- Working on a monorepo? Frontend rules don't leak into backend projects.
+- Agent learns "this project uses pino, not console.log" — and it sticks across sessions
+- When you say "actually, GraphQL, not REST" — the old rule is replaced, not duplicated
+- Open a project untouched for 35 days — the agent asks before injecting stale context
+- Working in a monorepo — frontend rules don't leak into backend projects
 
 ### Project-aware Code Review
 
-Before you commit — or at any point — `review_current_changes` checks your working diff against your project's stored rules. You call it when you want a review. The agent can also decide to invoke it proactively. It doesn't run automatically on every keystroke; each invocation is an explicit LLM call.
+`review_current_changes` checks your working diff against your project's stored rules. The reviewer is a separate, read-only agent — it can't modify files. It tells you which file, which line, what's wrong, and how severe.
 
-What you get in practice:
-
-- Catches `any` types, missing transaction timeouts, console.log calls — not from a lint config, but from your project's own rules.
-- Reviewer has no write tools loaded. Not "asked to be read-only." Configured that way.
-- Diff is chunked. Large diffs report which files were covered and which were skipped.
-- If the model returns garbage, you get a parse error, not a silent "no issues found."
+- Catches `any` types, missing transaction timeouts, missing tests — not from lint, from your project's own rules
+- Reviewer's session has no write tools loaded. Not "asked to be read-only." Configured that way
+- Large diffs are chunked. Skipped files are reported. Nothing is silently omitted
+- Model returns garbage → you get a parse error. Not a silent "no issues found"
+- Agent is instructed to invoke it before committing when project rules exist
 
 ---
 
-## Compared to Pi's built-in tools
+## What makes it different
 
-Pi ships a Memory tool and a SubAgent session API. These are the building blocks. Triple-pi uses them and adds the parts that make them trustworthy outside of demos.
+The agent memory and code review space is full of demos that work in a 5-minute video and break in production. Here's what Triple-pi does differently.
 
-**Memory pipeline — 6 stages, each can reject the batch**
+**Memory: a pipeline, not a save button.**
 
-| Pi built-in | Triple-pi |
+| Common approach | Triple-pi |
 |---|---|
-| Saves whatever the LLM outputs | Extraction → validation → review → consolidation → commit |
-| No evidence required | Evidence must be a verbatim user message substring |
-| LLM picks scope | Global downgraded to project without explicit cross-project evidence |
-| No review step | Second LLM pass: keep or remove only, cannot rewrite |
-| Overwrite on save | Immutable revision snapshots |
-| No lifecycle | 30d hot → 31-90d cold (asks) → >90d archive (rename, not delete) |
+| LLM output written directly to disk | 6-stage pipeline; any stage can reject the batch |
+| No evidence required — trust the model | Evidence must be a verbatim user message substring |
+| LLM picks global/project scope freely | Global auto-downgraded to project without explicit cross-project evidence |
+| Overwrite on save, no history | Immutable revision snapshots, proper chain pointers |
+| Memory lives forever or gets deleted | 30d hot → 31-90d cold (asks) → >90d archive (renamed, not deleted) |
+| Silent on failure | Fail-closed; stage-classified errors; transient retry with backoff |
+| No concurrent write protection | Process lock; branch-safe scheduler with generation tracking |
 
-**Reviewer — code-level isolation, not prompt-level**
+**Reviewer: isolation in code, not in a prompt.**
 
-| Pi built-in | Triple-pi |
+| Common approach | Triple-pi |
 |---|---|
-| Prompt says "read only" | Session configured with noExtensions, noSkills, noContextFiles |
-| No write-tool restriction | Tool allowlist `[read, grep, find, ls]` enforced by registry |
-| No change verification | Git status + file hash snapshot before and after |
-| Raw model output | Strict schema: passed ↔ zero findings, line positive integer, etc. |
-| Full diff in prompt | Chunked by file/hunk; partial coverage tracked |
-| No memory integration | Multi-keyword OR-search from diff content |
+| System prompt: "please don't modify files" | Session configured: no extensions, no skills, no context files loaded |
+| No actual tool restriction, trust the model | Tool allowlist `[read, grep, find, ls]` — write tools don't exist in the session |
+| No proof files weren't modified | Git status + file hash snapshot before and after the review |
+| Raw model output; hope it's valid JSON | Strict schema enforced in code; `passed` ↔ zero findings; parse ≠ schema ≠ semantic failure |
+| Full diff dumped into one prompt | Chunked by file and hunk; binary/unreadable skipped with reason; partial coverage recorded |
+| Manual memory lookup | Multi-keyword OR-search from diff content, ranked by relevance |
+
+**Evaluation: a system, not an anecdote.**
+
+| Common approach | Triple-pi |
+|---|---|
+| Run it a few times, screenshot | 178 deterministic + 46 recorded full-pipeline tests |
+| "Looks right" | Live eval with exit code semantics: infra failure ≠ semantic failure |
+| Noise case "passes" because empty=empty | Noise precision = null, excluded from macro averaging |
 
 ---
 
@@ -74,7 +78,7 @@ cd Triple-pi
 npm run setup
 ```
 
-Node.js `>=22.19.0`.
+Node.js `>=22.19.0`. Uses [Pi](https://github.com/earendil-works/pi) as the agent runtime.
 
 ## Verify
 
@@ -89,15 +93,13 @@ npm run demo            # Offline smoke test
 
 ## Evaluation
 
-Three layers, different goals.
-
 | Layer | Runs | Validates |
 |---|---|---|
 | 178 deterministic tests | Every push, 0 LLM | Code logic: parsing, locking, validation, scheduling |
 | 46 recorded pipeline tests | Every push, mock LLM | End-to-end wiring: extraction through commit |
 | Live eval | Opt-in, model required | Model quality: precision, recall, noise rejection |
 
-Live eval exit codes: 2 = infra failure, 1 = semantic mismatch, 0 = pass.
+Exit codes: 2 = infra failure, 1 = semantic mismatch, 0 = pass.
 
 ---
 
