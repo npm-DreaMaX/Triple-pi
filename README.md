@@ -80,6 +80,8 @@ npm run setup
 
 Node.js `>=22.19.0`. Uses [Pi](https://github.com/earendil-works/pi) as the agent runtime.
 
+After setup, start Pi as usual. Triple-pi's tools (`SaveMemory`, `SearchMemory`, `review_current_changes`) are loaded automatically — no separate command, no separate process.
+
 ## Verify
 
 ```bash
