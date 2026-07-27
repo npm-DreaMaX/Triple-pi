@@ -1,8 +1,6 @@
 # Triple-pi
 
-让 Coding Agent 记住你的项目习惯，并在提交前按项目规则检查代码变更。
-
-基于 [Pi Agent Runtime](https://github.com/earendil-works/pi)，不修改 Runtime 源码。
+Persistent memory and project-aware code review for the [Pi coding agent](https://github.com/earendil-works/pi). Built as a Pi extension — does not modify runtime source.
 
 [![CI](https://github.com/npm-DreaMaX/Triple-pi/actions/workflows/ci.yml/badge.svg)](https://github.com/npm-DreaMaX/Triple-pi/actions/workflows/ci.yml)
 [![Node](https://img.shields.io/badge/node-%3E%3D22.19.0-brightgreen)](https://nodejs.org)
@@ -10,159 +8,146 @@
 
 ---
 
-## 干什么的
+## What it does
 
-两个模块：
+Two modules, one repository:
 
-**Persistent Memory** — Agent 对话结束后自动提取项目规则、偏好、技术决策，下次打开同一项目自动加载。
+| Module | Description |
+|---|---|
+| **Memory** | Extracts project rules, decisions and preferences from agent conversations. Injects them into future sessions so the agent remembers your project context across sessions. |
+| **Reviewer** | Spawns a read-only sub-agent to check staged and unstaged changes against your project's memory before you commit. |
 
-**Reviewer SubAgent** — 在你提交代码之前，对照项目 Memory 里的规则检查 git diff。只读，不能改文件。
+Memory and Reviewer share one `FilesystemMemoryRepository` — rules you save are available to both modules.
 
 ---
 
-## 安装
+## Install
 
 ```bash
 git clone --recurse-submodules https://github.com/npm-DreaMaX/Triple-pi.git
 cd Triple-pi
-npm run setup
+npm run setup          # Build Pi, install deps, symlink the extension
 ```
 
-Node.js `>=22.19.0`。
+Requires Node.js `>=22.19.0`.
+
+`npm run setup` installs `extensions/` into Pi's agent directory as the `triple-pi` extension. The extension registers `SaveMemory`, `SearchMemory`, `delegate_review`, and `review_current_changes` tools. It also hooks into `agent_settled` (auto-extraction) and `before_agent_start` (memory injection).
 
 ---
 
-## 验证
+## Verify
 
 ```bash
-npm run typecheck      # TypeScript 严格模式
-npm test               # 178 条自动化测试
-npm run eval:recorded   # 46 条全链路测试
-npm run demo            # 离线 Demo
+npm run typecheck      # TypeScript strict mode
+npm test               # 178 deterministic tests (no network, no LLM)
+npm run eval:recorded   # 46 full-pipeline tests with mock LLM
+npm run demo            # Offline end-to-end smoke test
+```
+
+Live evaluation against real models is opt-in:
+
+```bash
+TRIPLE_PI_EVAL_MODEL=<provider>/<model> npm run eval:live
 ```
 
 ---
 
-## 做了什么 Pi 现有插件没做的事
+## What this project adds on top of Pi
 
-Pi 生态有 Memory 工具和 SubAgent 模板，但它们侧重"能不能跑通"。这个项目在意的是"跑出来的结果能不能信"。
+Pi ships with a Memory tool (file I/O for a `/memories` directory) and SubAgent session templates. They work for demos.
 
-**Memory：不只是 LLM 输出直接写盘**
+This project adds the parts that make them usable outside of demos:
+
+- **Extraction pipeline.** Pi's stock Memory tool saves whatever the agent asks it to save. Triple-pi adds a 6-stage automatic extraction pipeline (redact → extract → validate → review → consolidate → commit). Each stage can reject the batch. If any stage fails, nothing is written.
+- **Evidence grounding.** Every automatically extracted record carries a `provenance.evidence` field — a verbatim quote from a user message. The LLM cannot fabricate evidence. Assistant text is never accepted as a source.
+- **Deterministic scope resolution.** A candidate marked `global` by the LLM is downgraded to `project` unless the user's quoted evidence explicitly states cross-project intent. No extra confirmation dialog, no user interruption — the code decides.
+- **Grounded review.** A second LLM call reviews extraction candidates. It can only keep or remove them. It cannot rewrite titles, content, or evidence. The schema is enforced — any attempt to modify a field causes rejection.
+- **Immutable revision history.** Every update to a record saves the prior version to `revisions/`. The chain is a proper linked list (`previousRevisionId` links to the prior snapshot), not a self-referencing pointer.
+- **Lifecycle state machine.** 0-30 days hot, 31-90 days cold (asks before injecting), >90 days auto-archived (renamed, not deleted). Project isolation is based on `realpath(cwd)`, not git remote, so monorepo subdirectories are naturally separate.
+- **Branch-safe extraction.** The scheduler tracks `generation + sessionId + branchLeafId` per job. A checkpoint from a discarded branch cannot commit to the current tree.
+- **Reviewer isolation through ResourceLoader, not prompts.** The reviewer session is created with `noExtensions: true`, `noSkills: true`, `noContextFiles: true`. Only `read`, `grep`, `find`, `ls` are loaded. Pi's tool registry enforces the allowlist — the model cannot request a write tool because none exists in the session.
+- **Worktree snapshot verification.** Git status and file hashes are captured before and after the review. If they differ, the result is `worktree-changed`, not a silent "no files modified."
+- **Strict output schema.** `passed` requires zero findings. `issues_found` requires at least one. `description` must be non-empty. `line` must be a positive integer. Severity must be `low | medium | high`. JSON parse failure and schema violation are distinct outcomes and never reported as "no issues found."
+- **Chunked diff review with partial coverage tracking.** Files are chunked by hunk. If the diff exceeds the budget, skipped files are recorded explicitly. The result carries a `coverage` field (`complete` or `partial`). Nothing is silently dropped.
+- **Three-layer eval with exit-code semantics.** 178 deterministic tests (0 network, 0 LLM) run on every push. 46 recorded full-pipeline tests verify wiring with mock LLM. Live eval is opt-in and exits 2 on infrastructure failure, 1 on semantic mismatch, 0 on all-pass. A noise case does not "pass" because the repository happened to be empty after a crash.
+
+---
+
+## Storage layout
 
 ```
-对话结束
-  → secret 脱敏
-  → LLM 提取候选
-  → strict validation（evidence 必须是用户原话逐字子串，不存在就拒绝）
-  → Grounded Review（只允许 keep/remove，不允许改写）
-  → consolidation（去重、替换、跳过）
-  → 文件锁 + temp→rename 原子写入
+~/.triple-pi/memory-v1/
+├── global/entries/                 # Shared across all projects
+├── projects/<id>/entries/          # Per-project records
+├── projects/<id>/revisions/        # Immutable record history
+├── projects/<id>/working/          # Scratchpad and daily timeline
+├── archive/projects/<id>/          # Auto-archived after 90 days of inactivity
+├── extractions/<project-id>/       # Idempotent source manifests
+└── signals/<project-id>/           # Reinforcement state
 ```
 
-| | 常见做法 | 这里做的 |
+Project identity is derived from `realpath(cwd)`. To share memory across different clone paths, drop a `.triple-pi/project.json` with a stable `projectId` in the project root.
+
+---
+
+## Lifecycle
+
+| Inactivity | State | Behavior |
 |---|---|---|
-| 证据 | 信模型 | 必须是用户原话逐字子串，assistant 说的不算 |
-| 项目隔离 | 不管，或靠 git remote | cwd 自动识别，monorepo 子目录天然分开 |
-| 跨项目共享 | LLM 自己判断 | 自动提取仅当用户明确说"所有项目都"才 global，否则自动降级 project |
-| 过期处理 | 一直在或直接删 | 30 天冷态提醒 → 90 天无损归档（改名，不删） |
-| 写入失败 | 吞掉异常 | 分类到具体阶段，该重试的有限重试，不改重试的不反复付费 |
+| 0–30 days | hot | Memory injected normally. Activity marker refreshed on each session. |
+| 31–90 days | cold | On next session start, asks whether to restore project memory. If declined, project memory stays cold this session; global memory remains visible. |
+| >90 days | archive-due | On next session start, the project directory is atomically renamed into `archive/`. A notification is shown. Restorable with `/memory-restore`. |
 
-**Reviewer：不是 prompt 说"请只读"，是代码级保证**
-
-| | 常见做法 | 这里做的 |
-|---|---|---|
-| 隔离方式 | prompt 请求只读 | 禁掉扩展/技能/上下文文件加载，只开放 read grep find ls |
-| 验证没改文件 | 不验证 | 审查前后 worktree SHA-256 快照比对 |
-| 输出处理 | 信它是 JSON | 区分格式错 vs 内容错；passed 必须零 findings；line 必须是正整数 |
-| 超时保护 | 可能没有 | Promise.race 硬超时，迟到结果被丢弃 |
-| diff 覆盖 | 有就行 | 分块审查，不静默截断；partial 时明确标注哪些文件没覆盖到 |
-
-**评测：不是跑几遍截个图**
-
-```
-确定性测试 178 条  →  每次 push 自动跑，不依赖 LLM，零成本
-Recorded 46 条     →  验证全链路管线接线正确
-Live Eval (opt-in)  →  验证真实模型质量，显式配模型才运行
-```
-
-Live Eval 的退出码：provider 崩了 exit 2，语义不匹配 exit 1，全通过 exit 0。noise case（期望零记忆）不会因为 provider 崩了就"恰好零匹配 F1=1"。
+Archived projects reject writes. Global records and manual saves are never archived.
 
 ---
 
-## Memory 能力一览
-
-- 自动提取：`agent_settled` 触发，后台异步，不阻塞对话
-- 手动保存：用户确认后写盘，支持 project / global 两种作用域
-- 跨 Session 召回：下次打开同一项目，自动注入记忆索引；需要正文时 SearchMemory
-- 纠错更新：说"其实用 GraphQL，不是 REST"，会更新旧记忆，不会同时保留两条矛盾规则
-- 生命周期：hot (≤30d) → cold (31-90d，下次打开询问) → archive (>90d，无损改名)
-- 不可变审计：每次更新自动保存上一版本到 revisions 目录
-- 工作状态：最近对话的 user request + assistant 报告，以不可信上下文注入（不进 system prompt）
-
-## Reviewer 能力一览
-
-- 自动采集：git staged + unstaged + untracked 全量获取
-- 关键词检索：从 diff 和文件内容提取搜索词，按优先级排序后多路搜索 Memory
-- 分块审查：按文件和 hunk 分块，不静默截断
-- Partial coverage：diff 超过预算时明确标注哪些文件没审查
-- 硬超时 + 安全清理：调用方在 deadline 后必返回，child session 被 abort + dispose
-- 严格输出：passed 零 findings、issues_found 非空、description 非空、line 正整数
-
----
-
-## 项目结构
+## Project structure
 
 ```
 extensions/
-├── index.ts                  # 统一入口
+├── index.ts                  # Unified entry point
 ├── memory/
-│   ├── index.ts              # Extension 注册、工具、生命周期
-│   ├── repository.ts         # 存储、原子写入、锁、搜索、revision
-│   ├── domain.ts             # 数据模型
-│   ├── project-identity.ts   # cwd → 稳定 project ID
-│   ├── validation.ts         # 手动/自动共用校验规则
-│   ├── working-state.ts      # 工作状态
-│   └── extraction/           # 自动提取管线
-│       ├── coordinator.ts    # 流程编排
-│       ├── scheduler.ts      # branch-safe 异步调度
-│       ├── provider.ts       # LLM 调用
-│       ├── pipeline.ts       # secret 脱敏 + 严格校验
-│       ├── review.ts         # grounded reviewer
-│       ├── signals.ts        # fingerprint + reinforcement
-│       ├── consolidation.ts  # 去重合并
-│       └── source.ts         # 对话增量 + checkpoint
+│   ├── index.ts              # Extension lifecycle, tools, hooks
+│   ├── repository.ts         # Locking, atomic I/O, search, revisions
+│   ├── domain.ts             # Shared types
+│   ├── project-identity.ts   # cwd → project ID resolution
+│   ├── validation.ts         # Manual and automatic write validation
+│   ├── working-state.ts      # Session working state management
+│   └── extraction/           # Automatic extraction pipeline
 └── subagent/
-    ├── index.ts              # Reviewer 工具注册
-    ├── manager.ts            # Session 管理
-    ├── review-core.ts        # git diff、检索、分块、解析
-    └── types.ts              # 类型
+    ├── index.ts              # Reviewer tool registration
+    ├── manager.ts            # Session creation, timeout, cleanup
+    ├── review-core.ts        # Git diff collection, search, chunking, parsing
+    └── types.ts              # Discriminated result types
 
-eval/     # 评测（三层）
-docs/     # 文档
-test/     # 测试（21 文件 / 178 条）
-scripts/  # 安装、诊断、Demo
+eval/     # Evaluation harness (3-layer)
+docs/     # Design docs, interview prep, demo runbook
+test/     # 21 files, 178 tests
+scripts/  # Installer, status diagnostics, demo
 ```
 
 ---
 
-## 局限
+## Limitations
 
-- 基于关键词子串匹配，没有语义/向量检索（当前规模够用；跨语言用 diff 符号补足）
-- secret 检测用正则，不覆盖组织自定义密钥格式
-- 单用户，没有多开发者共享
+- Search is keyword-based (substring match on title + content). No semantic or vector retrieval.
+- Secret redaction covers common patterns (AWS, GitHub, JWT, Bearer, private keys) but not arbitrary custom formats.
+- Single-user. No shared or multi-tenant memory.
+- File writes use `temp + rename` for atomic visibility, not `fsync`. A power loss during write may lose the in-flight record.
 
 ---
 
-## 文档
+## Docs
 
 | | |
 |---|---|
-| [Memory 设计](./docs/design/memory.md) | project identity、作用域、生命周期、提取管线 |
-| [Reviewer 设计](./docs/design/reviewer.md) | 接线、diff 采集、检索、分块、隔离模型 |
-| [评测体系](./docs/evaluation.md) | 三层验证、指标定义、如何复现 |
-| [Demo runbook](./docs/demo.md) | 离线端到端验证 |
-| [面试准备](./docs/interview.md) | 常见追问、STAR 故事、真实踩坑记录 |
-| [历史日志](./docs/history/MEMORY_REBUILD.md) | 设计迭代记录 |
+| [Memory design](./docs/design/memory.md) | Identity, scope, lifecycle, extraction pipeline |
+| [Reviewer design](./docs/design/reviewer.md) | Wiring, diff collection, retrieval, chunking, isolation |
+| [Evaluation](./docs/evaluation.md) | Three-layer validation, metrics, evidence contracts |
+| [Demo runbook](./docs/demo.md) | Offline end-to-end smoke test |
+| [Interview prep](./docs/interview.md) | Common questions, STAR stories, bug stories |
+| [History](./docs/history/MEMORY_REBUILD.md) | Design iteration log (historical, not current) |
 
 ## License
 
