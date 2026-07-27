@@ -184,7 +184,7 @@ A: 文件系统物理隔离——`projects/<id>/entries/` 和 `global/entries/` 
 | Recorded Eval | 46 条 / 6 文件 |
 | TypeScript | strict mode |
 | Demo | 离线端到端，不依赖外部 API |
-| 模型 | 通过环境变量切换（DeepSeek 兼容 OpenAI / Anthropic 等） |
+| 模型 | 通过环境变量切换（DeepSeek / 其他 OpenAI 兼容 provider） |
 
 ## 面试必问：跟 Pi 生态已有的 Memory/SubAgent 插件有什么区别
 
