@@ -1,0 +1,729 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Triple-pi — 下一代终端 AI 编码代理</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%23a855f7'/><text x='50%25' y='55%25' dominant-baseline='middle' text-anchor='middle' font-size='20' font-weight='bold' fill='white'>π</text></svg>">
+  <style>
+    /* ===== Reset & Base ===== */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans SC', system-ui, sans-serif;
+      background: #0a0a0f;
+      color: #e1e1e6;
+      line-height: 1.6;
+      overflow-x: hidden;
+    }
+    a { color: #c084fc; text-decoration: none; transition: color 0.2s; }
+    a:hover { color: #e0b0ff; }
+
+    /* ===== Navigation ===== */
+    nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 1000;
+      background: rgba(10, 10, 15, 0.82);
+      backdrop-filter: blur(16px) saturate(180%);
+      -webkit-backdrop-filter: blur(16px) saturate(180%);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+      padding: 0 2rem;
+    }
+    .nav-inner {
+      max-width: 1200px; margin: 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+      height: 60px;
+    }
+    .nav-logo {
+      display: flex; align-items: center; gap: 10px;
+      font-size: 1.25rem; font-weight: 800; color: #fff; letter-spacing: -0.3px;
+    }
+    .nav-logo .logo-icon {
+      width: 34px; height: 34px;
+      background: linear-gradient(135deg, #c084fc 0%, #e879f9 50%, #818cf8 100%);
+      border-radius: 9px;
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 900; font-size: 1.15rem; color: #fff;
+      box-shadow: 0 0 20px rgba(192, 132, 252, 0.35);
+    }
+    .nav-links { display: flex; gap: 2rem; list-style: none; }
+    .nav-links a { color: #94a3b8; font-size: 0.88rem; font-weight: 500; transition: all 0.2s; }
+    .nav-links a:hover { color: #fff; text-decoration: none; }
+
+    /* ===== Hero ===== */
+    .hero {
+      min-height: 100vh; display: flex; align-items: center; justify-content: center;
+      text-align: center; padding: 6rem 2rem 4rem;
+      position: relative; overflow: hidden;
+    }
+    .hero-bg {
+      position: absolute; inset: 0; pointer-events: none;
+    }
+    .hero-bg .orb {
+      position: absolute; border-radius: 50%; filter: blur(120px); opacity: 0.55;
+    }
+    .orb-1 {
+      width: 600px; height: 600px;
+      background: radial-gradient(circle, rgba(192,132,252,0.6), transparent 70%);
+      top: -150px; left: -100px;
+    }
+    .orb-2 {
+      width: 500px; height: 500px;
+      background: radial-gradient(circle, rgba(232,121,249,0.5), transparent 70%);
+      bottom: -120px; right: -80px;
+    }
+    .orb-3 {
+      width: 400px; height: 400px;
+      background: radial-gradient(circle, rgba(129,140,248,0.45), transparent 70%);
+      top: 50%; left: 55%; transform: translate(-50%, -50%);
+    }
+    .orb-4 {
+      width: 350px; height: 350px;
+      background: radial-gradient(circle, rgba(56,189,248,0.3), transparent 70%);
+      top: 30%; left: 5%;
+    }
+    .hero-content { position: relative; z-index: 1; max-width: 860px; }
+    .hero-badge {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 5px 18px;
+      background: rgba(192, 132, 252, 0.1); border: 1px solid rgba(192, 132, 252, 0.25);
+      border-radius: 100px; font-size: 0.8rem; color: #c084fc; font-weight: 500;
+      margin-bottom: 1.75rem; letter-spacing: 0.3px;
+    }
+    .hero-badge .dot {
+      width: 7px; height: 7px; background: #c084fc; border-radius: 50%;
+      box-shadow: 0 0 8px rgba(192, 132, 252, 0.7);
+      animation: pulse 2s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50%      { opacity: 0.4; }
+    }
+    .hero h1 {
+      font-size: clamp(2.8rem, 7vw, 4.5rem); font-weight: 900;
+      letter-spacing: -1px; line-height: 1.1; margin-bottom: 1.5rem;
+    }
+    .hero h1 .grad {
+      background: linear-gradient(135deg, #e0b0ff 0%, #c084fc 25%, #e879f9 55%, #818cf8 85%, #38bdf8 100%);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    .hero h1 .white { color: #f8fafc; }
+    .hero p {
+      font-size: 1.15rem; color: #94a3b8; max-width: 620px;
+      margin: 0 auto 2.75rem; line-height: 1.75; font-weight: 400;
+    }
+    .hero-actions { display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap; }
+    .btn {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 13px 30px; border-radius: 10px; font-size: 0.95rem; font-weight: 600;
+      cursor: pointer; transition: all 0.3s; border: none; text-decoration: none;
+      letter-spacing: 0.1px;
+    }
+    .btn-primary {
+      background: linear-gradient(135deg, #c084fc 0%, #e879f9 50%, #818cf8 100%);
+      color: #fff; box-shadow: 0 4px 24px rgba(192, 132, 252, 0.35);
+      position: relative; overflow: hidden;
+    }
+    .btn-primary::after {
+      content: ''; position: absolute; inset: 0;
+      background: linear-gradient(135deg, transparent 0%, rgba(255,255,255,0.12) 50%, transparent 100%);
+      transform: translateX(-100%); transition: transform 0.6s;
+    }
+    .btn-primary:hover::after { transform: translateX(100%); }
+    .btn-primary:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 32px rgba(192, 132, 252, 0.5);
+    }
+    .btn-secondary {
+      background: rgba(255, 255, 255, 0.04); color: #e2e8f0;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+    .btn-secondary:hover {
+      background: rgba(255, 255, 255, 0.08); border-color: rgba(192, 132, 252, 0.35);
+      transform: translateY(-2px);
+    }
+    .btn svg { width: 18px; height: 18px; }
+
+    /* ===== Sections ===== */
+    section { padding: 5.5rem 2rem; }
+    .section-inner { max-width: 1120px; margin: 0 auto; }
+    .section-label {
+      display: inline-flex; align-items: center; gap: 10px;
+      font-size: 0.78rem; font-weight: 600;
+      color: #c084fc; letter-spacing: 1.8px; text-transform: uppercase;
+      margin-bottom: 0.75rem;
+    }
+    .section-label::before {
+      content: ''; width: 20px; height: 1.5px;
+      background: linear-gradient(90deg, #c084fc, transparent); border-radius: 1px;
+    }
+    .section-title {
+      font-size: clamp(1.8rem, 3.5vw, 2.5rem); font-weight: 800;
+      color: #f8fafc; margin-bottom: 1rem; letter-spacing: -0.5px;
+    }
+    .section-desc {
+      font-size: 1.05rem; color: #94a3b8; max-width: 640px;
+      margin-bottom: 3.5rem; line-height: 1.7;
+    }
+
+    /* ===== Pi vs Triple-pi Comparison ===== */
+    .vs-section {
+      background: linear-gradient(180deg, rgba(192,132,252,0.03) 0%, rgba(129,140,248,0.03) 100%);
+      border-top: 1px solid rgba(255, 255, 255, 0.05);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    }
+    .vs-table-wrap {
+      overflow-x: auto; margin-bottom: 2rem;
+    }
+    .vs-table {
+      width: 100%; border-collapse: collapse;
+      border-radius: 14px; overflow: hidden;
+      border: 1px solid rgba(255, 255, 255, 0.07);
+    }
+    .vs-table th {
+      text-align: left; padding: 1rem 1.5rem;
+      font-size: 0.9rem; font-weight: 700; letter-spacing: 0.3px;
+    }
+    .vs-table th:first-child { background: rgba(255,255,255,0.02); color: #94a3b8; }
+    .vs-table th.pi-col { background: rgba(148,163,184,0.06); color: #94a3b8; }
+    .vs-table th.triple-col {
+      background: linear-gradient(135deg, rgba(192,132,252,0.12), rgba(129,140,248,0.1));
+      color: #e0b0ff;
+    }
+    .vs-table td {
+      padding: 0.85rem 1.5rem; font-size: 0.9rem;
+      border-top: 1px solid rgba(255, 255, 255, 0.04);
+      color: #cbd5e1;
+    }
+    .vs-table td:first-child { color: #f1f5f9; font-weight: 500; }
+    .vs-table td.pi-col { color: #94a3b8; }
+    .vs-table td.triple-col {
+      background: rgba(192,132,252,0.04); color: #e2e8f0; font-weight: 500;
+    }
+    .check { color: #4ade80; margin-right: 4px; }
+    .dash { color: #64748b; }
+    .star { color: #facc15; }
+
+    /* ===== Features Grid ===== */
+    .features-grid {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 1.5rem;
+    }
+    .feature-card {
+      background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.06);
+      border-radius: 14px; padding: 2rem;
+      transition: all 0.3s; position: relative; overflow: hidden;
+    }
+    .feature-card::before {
+      content: ''; position: absolute; top: 0; left: 0; right: 0; height: 1px;
+      background: linear-gradient(90deg, transparent, rgba(192,132,252,0.2), transparent);
+      opacity: 0; transition: opacity 0.3s;
+    }
+    .feature-card:hover::before { opacity: 1; }
+    .feature-card:hover {
+      border-color: rgba(192, 132, 252, 0.25);
+      transform: translateY(-5px);
+      box-shadow: 0 20px 48px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(192,132,252,0.08);
+    }
+    .feature-icon {
+      width: 46px; height: 46px; border-radius: 12px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 1.35rem; margin-bottom: 1.25rem;
+    }
+    .fi-purple { background: linear-gradient(135deg, rgba(192,132,252,0.2), rgba(192,132,252,0.08)); color: #c084fc; }
+    .fi-pink   { background: linear-gradient(135deg, rgba(232,121,249,0.2), rgba(232,121,249,0.08)); color: #e879f9; }
+    .fi-blue   { background: linear-gradient(135deg, rgba(129,140,248,0.2), rgba(129,140,248,0.08)); color: #818cf8; }
+    .fi-cyan   { background: linear-gradient(135deg, rgba(56,189,248,0.2), rgba(56,189,248,0.08)); color: #38bdf8; }
+    .fi-green  { background: linear-gradient(135deg, rgba(74,222,128,0.2), rgba(74,222,128,0.08)); color: #4ade80; }
+    .fi-amber  { background: linear-gradient(135deg, rgba(251,191,36,0.2), rgba(251,191,36,0.08)); color: #fbbf24; }
+    .feature-card h3 { font-size: 1.08rem; color: #f1f5f9; margin-bottom: 0.6rem; font-weight: 700; }
+    .feature-card p  { font-size: 0.9rem; color: #94a3b8; line-height: 1.65; }
+
+    /* ===== Triple-pi Exclusive ===== */
+    .exclusive-section {
+      background: linear-gradient(180deg, rgba(192,132,252,0.04) 0%, rgba(232,121,249,0.03) 100%);
+      border-top: 1px solid rgba(255, 255, 255, 0.05);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    }
+    .exclusive-grid {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+      gap: 1.5rem;
+    }
+    .exclusive-card {
+      background: rgba(255, 255, 255, 0.025);
+      border: 1px solid rgba(192, 132, 252, 0.15);
+      border-radius: 16px; padding: 2rem;
+      transition: all 0.3s;
+    }
+    .exclusive-card:hover {
+      border-color: rgba(192, 132, 252, 0.35);
+      box-shadow: 0 12px 40px rgba(192, 132, 252, 0.08);
+      transform: translateY(-3px);
+    }
+    .exclusive-num {
+      font-size: 0.75rem; font-weight: 800; color: #c084fc;
+      letter-spacing: 1px; margin-bottom: 0.75rem;
+    }
+    .exclusive-card h3 { font-size: 1.15rem; color: #f8fafc; margin-bottom: 0.6rem; font-weight: 700; }
+    .exclusive-card p  { font-size: 0.9rem; color: #94a3b8; line-height: 1.7; }
+
+    /* ===== Architecture Diagram ===== */
+    .arch-diagram {
+      display: flex; flex-direction: column; align-items: center; gap: 1rem;
+      margin: 2rem 0;
+    }
+    .arch-layer {
+      padding: 1rem 2rem; border-radius: 12px; font-weight: 700;
+      text-align: center; font-size: 0.92rem;
+    }
+    .arch-top {
+      background: linear-gradient(135deg, rgba(192,132,252,0.2), rgba(232,121,249,0.15));
+      border: 2px solid rgba(192,132,252,0.4); color: #e0b0ff;
+    }
+    .arch-mid {
+      background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08);
+      color: #e2e8f0;
+    }
+    .arch-base {
+      background: linear-gradient(135deg, rgba(56,189,248,0.15), rgba(129,140,248,0.12));
+      border: 1px solid rgba(56,189,248,0.3); color: #7dd3fc;
+    }
+    .arch-arrow {
+      color: #64748b; font-size: 1.5rem; line-height: 1;
+    }
+
+    /* ===== Code Block ===== */
+    .code-block {
+      background: rgba(0, 0, 0, 0.4); border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 12px; padding: 1.5rem; margin-top: 1.5rem;
+      font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+      font-size: 0.82rem; line-height: 1.75; overflow-x: auto;
+    }
+    .code-c { color: #6b7280; }
+    .code-k { color: #f472b6; }
+    .code-s { color: #7dd3fc; }
+    .code-f { color: #c084fc; }
+    .code-v { color: #fbbf24; }
+
+    /* ===== Providers ===== */
+    .providers-cloud {
+      display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 1rem;
+    }
+    .provider-tag {
+      padding: 5px 14px; border-radius: 100px; font-size: 0.8rem; font-weight: 500;
+      background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.07);
+      color: #cbd5e1; white-space: nowrap; transition: all 0.2s;
+    }
+    .provider-tag:hover {
+      border-color: rgba(192,132,252,0.3); background: rgba(192,132,252,0.06);
+      color: #e0b0ff;
+    }
+
+    /* ===== Stats ===== */
+    .stats-row {
+      display: flex; flex-wrap: wrap; justify-content: center; gap: 3rem;
+      margin-top: 3rem;
+    }
+    .stat { text-align: center; }
+    .stat-number {
+      font-size: 2.6rem; font-weight: 900;
+      background: linear-gradient(135deg, #c084fc 0%, #e879f9 50%, #818cf8 100%);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+      background-clip: text; letter-spacing: -1px;
+    }
+    .stat-label { color: #94a3b8; font-size: 0.88rem; margin-top: 0.25rem; font-weight: 500; }
+
+    /* ===== CTA ===== */
+    .cta-section {
+      text-align: center;
+      background: linear-gradient(180deg, rgba(192,132,252,0.05) 0%, rgba(10,10,15,1) 100%);
+      border-top: 1px solid rgba(255,255,255,0.05);
+    }
+    .cta-section .section-title { margin-bottom: 0.5rem; }
+    .cta-section .section-desc { margin-left: auto; margin-right: auto; margin-bottom: 2rem; }
+
+    /* ===== Footer ===== */
+    footer {
+      border-top: 1px solid rgba(255, 255, 255, 0.05);
+      padding: 2.5rem 2rem; text-align: center; color: #64748b; font-size: 0.85rem;
+    }
+    footer a { color: #94a3b8; }
+
+    /* ===== Responsive ===== */
+    @media (max-width: 768px) {
+      .nav-links { display: none; }
+      .features-grid, .exclusive-grid { grid-template-columns: 1fr; }
+      .stats-row { gap: 1.5rem; }
+      section { padding: 3rem 1.25rem; }
+    }
+
+    /* ===== Fade In ===== */
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(28px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    .reveal { animation: fadeUp 0.7s ease both; }
+    .r1 { animation-delay: 0.05s; }
+    .r2 { animation-delay: 0.15s; }
+    .r3 { animation-delay: 0.25s; }
+    .r4 { animation-delay: 0.35s; }
+  </style>
+</head>
+<body>
+
+  <!-- Navigation -->
+  <nav>
+    <div class="nav-inner">
+      <div class="nav-logo">
+        <div class="logo-icon">π³</div>
+        Triple-pi
+      </div>
+      <ul class="nav-links">
+        <li><a href="#vs">对比</a></li>
+        <li><a href="#exclusive">独有优势</a></li>
+        <li><a href="#features">功能全景</a></li>
+        <li><a href="#architecture">技术架构</a></li>
+        <li><a href="#providers">模型生态</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="hero">
+    <div class="hero-bg">
+      <div class="orb orb-1"></div>
+      <div class="orb orb-2"></div>
+      <div class="orb orb-3"></div>
+      <div class="orb orb-4"></div>
+    </div>
+    <div class="hero-content">
+      <div class="hero-badge reveal">
+        <span class="dot"></span> 基于 Pi Agent 构建 · 开源 &amp; 可定制
+      </div>
+      <h1 class="reveal r1">
+        <span class="white">从</span> <span class="grad">Pi</span> <span class="white">到</span> <span class="grad">Triple-pi</span><br>
+        <span class="white">AI 编码体验的</span> <span class="grad">三次方进化</span>
+      </h1>
+      <p class="reveal r2">
+        Triple-pi 继承 Pi Agent <strong>全部核心优势</strong>——极简哲学、激进扩展、
+        树形会话、多模式运行——并在此基础上注入独有增强，打造下一代终端 AI 编码代理。
+      </p>
+      <div class="hero-actions reveal r3">
+        <a href="#vs" class="btn btn-primary">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12l7 7 7-7"/></svg>
+          与 Pi 的对比
+        </a>
+        <a href="#exclusive" class="btn btn-secondary">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+          独有增强功能
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Pi vs Triple-pi -->
+  <section class="vs-section" id="vs">
+    <div class="section-inner">
+      <span class="section-label">正面比较</span>
+      <h2 class="section-title">Pi vs Triple-pi</h2>
+      <p class="section-desc">
+        Triple-pi 不是替代品，而是站在 Pi 肩膀上的增强版。Pi 能做的 Triple-pi 都能做——外加更多。
+      </p>
+      <div class="vs-table-wrap">
+        <table class="vs-table">
+          <thead>
+            <tr>
+              <th>能力维度</th>
+              <th class="pi-col">Pi Agent</th>
+              <th class="triple-col">✨ Triple-pi</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>4 种内置工具 (read/write/edit/bash)</td>
+              <td class="pi-col"><span class="check">✓</span> 原生支持</td>
+              <td class="triple-col"><span class="check">✓</span> 完全继承</td>
+            </tr>
+            <tr>
+              <td>30+ 模型提供商</td>
+              <td class="pi-col"><span class="check">✓</span> 全面覆盖</td>
+              <td class="triple-col"><span class="check">✓</span> 完全继承</td>
+            </tr>
+            <tr>
+              <td>4 种运行模式</td>
+              <td class="pi-col"><span class="check">✓</span> 交互/打印/JSON/RPC/SDK</td>
+              <td class="triple-col"><span class="check">✓</span> 完全继承 + 增强集成</td>
+            </tr>
+            <tr>
+              <td>TypeScript 扩展机制</td>
+              <td class="pi-col"><span class="check">✓</span> 强大扩展体系</td>
+              <td class="triple-col"><span class="check">✓</span> 完全兼容 + 预置精选扩展</td>
+            </tr>
+            <tr>
+              <td>Skills / Prompts / Themes</td>
+              <td class="pi-col"><span class="check">✓</span> 完整支持</td>
+              <td class="triple-col"><span class="check">✓</span> 完全兼容 + 内置增强主题</td>
+            </tr>
+            <tr>
+              <td>Pi Packages (npm/git)</td>
+              <td class="pi-col"><span class="check">✓</span> 丰富生态</td>
+              <td class="triple-col"><span class="check">✓</span> 全部可用 + 自有包仓库</td>
+            </tr>
+            <tr>
+              <td>会话树形分支</td>
+              <td class="pi-col"><span class="check">✓</span> JSONL 树结构</td>
+              <td class="triple-col"><span class="check">✓</span> 完全继承 + 可视化增强</td>
+            </tr>
+            <tr>
+              <td>上下文自动压缩</td>
+              <td class="pi-col"><span class="check">✓</span> 手动/自动</td>
+              <td class="triple-col"><span class="check">✓</span> 完全继承 + 智能策略优化</td>
+            </tr>
+            <tr>
+              <td>内置安全 / 权限门控</td>
+              <td class="pi-col"><span class="dash">—</span> 依赖容器/扩展</td>
+              <td class="triple-col"><span class="star">★</span> <strong>Triple-pi 独有</strong></td>
+            </tr>
+            <tr>
+              <td>团队协作 / 共享配置</td>
+              <td class="pi-col"><span class="dash">—</span> 需手动同步</td>
+              <td class="triple-col"><span class="star">★</span> <strong>Triple-pi 独有</strong></td>
+            </tr>
+            <tr>
+              <td>性能仪表板与用量统计</td>
+              <td class="pi-col"><span class="dash">—</span> 基础 Token 计数</td>
+              <td class="triple-col"><span class="star">★</span> <strong>Triple-pi 独有</strong></td>
+            </tr>
+            <tr>
+              <td>对话模板 / 快捷工作流</td>
+              <td class="pi-col"><span class="dash">—</span> Prompt Templates</td>
+              <td class="triple-col"><span class="star">★</span> <strong>Triple-pi 独有</strong></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- Triple-pi Exclusive -->
+  <section id="exclusive">
+    <div class="section-inner">
+      <span class="section-label">三次方进化</span>
+      <h2 class="section-title">Triple-pi 独有优势</h2>
+      <p class="section-desc">
+        在 Pi 坚如磐石的核心之上，Triple-pi 注入了这些独有能力——让终端 AI 编码从高效走向极致。
+      </p>
+      <div class="exclusive-grid">
+        <div class="exclusive-card">
+          <div class="exclusive-num">01</div>
+          <h3>🛡️ 内置安全门控</h3>
+          <p>不再依赖外部容器或手动扩展。Triple-pi 内置细粒度权限系统——文件读写白名单、网络访问控制、危险命令拦截。你可以按项目粒度设定安全策略，让 AI 在受控区域内自由发挥。</p>
+        </div>
+        <div class="exclusive-card">
+          <div class="exclusive-num">02</div>
+          <h3>👥 团队协作一流</h3>
+          <p>共享项目配置、扩展集和对话模板。团队成员 clone 仓库后即刻拥有统一的 AI 开发环境。技能包、主题和提示模板随项目版本管理，无需各自配置。</p>
+        </div>
+        <div class="exclusive-card">
+          <div class="exclusive-num">03</div>
+          <h3>📊 性能仪表板</h3>
+          <p>实时预览 Token 消耗、成本曲线、缓存命中率、会话吞吐量。可视化图表助你洞察 AI 使用模式，做出更明智的模型选择和提示优化决策。</p>
+        </div>
+        <div class="exclusive-card">
+          <div class="exclusive-num">04</div>
+          <h3>⚡ 对话模板引擎</h3>
+          <p>将高频任务封装为零输入模板——代码审查、发布检查、重构建议等。一键触发完整工作流，AI 自动按步骤执行。支持模板市场，分享和复用团队最佳实践。</p>
+        </div>
+        <div class="exclusive-card">
+          <div class="exclusive-num">05</div>
+          <h3>🎨 臻选主题系统</h3>
+          <p>内置 8 套精研主题，从暗夜紫到极光蓝。每一款都经过可读性调优，支持终端色彩空间自适应。修改即时生效，样式永不遮挡。</p>
+        </div>
+        <div class="exclusive-card">
+          <div class="exclusive-num">06</div>
+          <h3>🔍 增强上下文感知</h3>
+          <p>智能识别项目结构——Mono Repo、微服务、多语言混合。自动加载最相关的上下文文件，减少手动指定。理解你的项目组织方式，而非盲目拼接文件。</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- All Features -->
+  <section id="features">
+    <div class="section-inner">
+      <span class="section-label">功能全景</span>
+      <h2 class="section-title">Triple-pi = Pi 的全部 + 更多</h2>
+      <p class="section-desc">所有 Pi 的能力 Triple-pi 都原生提供，无需额外配置。</p>
+
+      <div class="features-grid">
+        <div class="feature-card">
+          <div class="feature-icon fi-purple">⚡</div>
+          <h3>极简内核</h3>
+          <p>仅提供 read / write / edit / bash 四种工具。不做子代理、不弹权限窗口、不内置待办——需要时通过扩展载入。</p>
+        </div>
+        <div class="feature-card">
+          <div class="feature-icon fi-pink">🧩</div>
+          <h3>激进扩展性</h3>
+          <p>Skills、Extensions、Packages、Themes——四种扩展机制让你按需构建。TypeScript 模块可替换内置工具、实现子代理、MCP 集成等任何功能。</p>
+        </div>
+        <div class="feature-card">
+          <div class="feature-icon fi-blue">🌳</div>
+          <h3>树形会话分支</h3>
+          <p>JSONL 树结构存储，原地分支不创建新文件。/tree 可视化浏览，/fork 回溯分叉，/clone 复制路径。多条探索共存，永不丢失。</p>
+        </div>
+        <div class="feature-card">
+          <div class="feature-icon fi-cyan">🎯</div>
+          <h3>四种运行模式</h3>
+          <p>交互模式（全功能 TUI）、打印模式（-p 管道友好）、JSON 模式（事件流）、RPC 模式（进程集成）、SDK 模式（程序嵌入）。</p>
+        </div>
+        <div class="feature-card">
+          <div class="feature-icon fi-green">💬</div>
+          <h3>消息队列</h3>
+          <p>Agent 工作期间随时提交转向/跟进消息。Enter 交付转向消息，Alt+Enter 交付跟进。Escape 取回未发消息。</p>
+        </div>
+        <div class="feature-card">
+          <div class="feature-icon fi-amber">🧠</div>
+          <h3>7 级思考控制</h3>
+          <p>off → max 七档推理深度。Shift+Tab 热切换，Ctrl+T 折叠思考块，Ctrl+O 折叠工具输出。</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Architecture -->
+  <section id="architecture" class="exclusive-section">
+    <div class="section-inner">
+      <span class="section-label">技术架构</span>
+      <h2 class="section-title">清晰的分层结构</h2>
+      <p class="section-desc">
+        Triple-pi 采用三层架构：稳固的 Pi Runtime 基础层、增强的整合层、以及面向用户的体验层。
+      </p>
+
+      <div class="arch-diagram">
+        <div class="arch-layer arch-top">
+          🎨 Triple-pi 体验层：独有功能、主题、模板、仪表板
+        </div>
+        <div class="arch-arrow">│</div>
+        <div class="arch-layer arch-mid">
+          🔌 Triple-pi 整合层：安全管理、团队协作、上下文增强
+        </div>
+        <div class="arch-arrow">│</div>
+        <div class="arch-layer arch-base">
+          ⚙️ Pi Runtime：编码代理 · 模型运行时 · 终端 UI · 扩展引擎
+        </div>
+      </div>
+
+      <div class="code-block">
+        <span class="code-c">// Triple-pi = Pi 的超级增强版</span><br>
+        <span class="code-c">// 100% 兼容 Pi 生态，叠加独有增强</span><br><br>
+        <span class="code-k">import</span> { createAgentSession } <span class="code-k">from</span> <span class="code-s">"@earendil-works/pi-coding-agent"</span>;<br>
+        <span class="code-k">import</span> { <span class="code-v">tripleEnhance</span> } <span class="code-k">from</span> <span class="code-s">"triple-pi"</span>;<br><br>
+        <span class="code-c">// 标准 Pi Session，注入 Triple-pi 增强</span><br>
+        <span class="code-k">const</span> session = <span class="code-k">await</span> <span class="code-f">createAgentSession</span>({ ... });<br>
+        <span class="code-k">await</span> <span class="code-f">tripleEnhance</span>(session, {<br>
+        &nbsp;&nbsp;<span class="code-v">security</span>: <span class="code-k">true</span>,<br>
+        &nbsp;&nbsp;<span class="code-v">dashboard</span>: <span class="code-k">true</span>,<br>
+        &nbsp;&nbsp;<span class="code-v">teamShare</span>: <span class="code-k">true</span>,<br>
+        &nbsp;&nbsp;<span class="code-v">theme</span>: <span class="code-s">"aurora"</span><br>
+        });<br><br>
+        <span class="code-c">// 获得 Pi 的全部能力 + Triple-pi 独有增强</span><br>
+        <span class="code-k">await</span> session.<span class="code-f">prompt</span>(<span class="code-s">"帮我重构这个模块"</span>);
+      </div>
+    </div>
+  </section>
+
+  <!-- Providers -->
+  <section id="providers">
+    <div class="section-inner">
+      <span class="section-label">模型生态</span>
+      <h2 class="section-title">30+ 提供商，100% 覆盖 Pi 支持</h2>
+      <p class="section-desc">
+        Triple-pi 完整继承 Pi 所有模型接入能力。订阅或 API Key，任你选择。
+      </p>
+
+      <h4 style="color:#94a3b8; font-size:0.85rem; margin-bottom:0.6rem; font-weight:600;">订阅接入</h4>
+      <div class="providers-cloud" style="margin-bottom:1.25rem;">
+        <span class="provider-tag">Anthropic Claude Pro/Max</span>
+        <span class="provider-tag">OpenAI ChatGPT Plus/Pro</span>
+        <span class="provider-tag">GitHub Copilot</span>
+      </div>
+
+      <h4 style="color:#94a3b8; font-size:0.85rem; margin-bottom:0.6rem; font-weight:600;">API Key 接入（部分列举）</h4>
+      <div class="providers-cloud">
+        <span class="provider-tag">Anthropic</span>
+        <span class="provider-tag">OpenAI</span>
+        <span class="provider-tag">Azure OpenAI</span>
+        <span class="provider-tag">Google Gemini</span>
+        <span class="provider-tag">Google Vertex</span>
+        <span class="provider-tag">Amazon Bedrock</span>
+        <span class="provider-tag">Mistral</span>
+        <span class="provider-tag">Groq</span>
+        <span class="provider-tag">Cerebras</span>
+        <span class="provider-tag">DeepSeek</span>
+        <span class="provider-tag">xAI</span>
+        <span class="provider-tag">OpenRouter</span>
+        <span class="provider-tag">Cloudflare AI</span>
+        <span class="provider-tag">Vercel AI Gateway</span>
+        <span class="provider-tag">Hugging Face</span>
+        <span class="provider-tag">Together AI</span>
+        <span class="provider-tag">Fireworks</span>
+        <span class="provider-tag">Kimi For Coding</span>
+        <span class="provider-tag">MiniMax</span>
+        <span class="provider-tag">Xiaomi MiMo</span>
+        <span class="provider-tag">NVIDIA NIM</span>
+        <span class="provider-tag">llama.cpp 本地模型</span>
+        <span class="provider-tag">… 以及自定义提供商</span>
+      </div>
+
+      <div class="stats-row">
+        <div class="stat">
+          <div class="stat-number">30+</div>
+          <div class="stat-label">模型提供商</div>
+        </div>
+        <div class="stat">
+          <div class="stat-number">4</div>
+          <div class="stat-label">内置核心工具</div>
+        </div>
+        <div class="stat">
+          <div class="stat-number">4+</div>
+          <div class="stat-label">运行模式</div>
+        </div>
+        <div class="stat">
+          <div class="stat-number">6</div>
+          <div class="stat-label">独有增强能力</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CTA -->
+  <section class="cta-section">
+    <div class="section-inner">
+      <h2 class="section-title">站在 Pi 的肩膀上，看得更远</h2>
+      <p class="section-desc">
+        Triple-pi = Pi 全部能力 + 安全门控 + 团队协作 + 仪表板 + 模板引擎 + 臻选主题 + 上下文增强。
+        <br>零学习成本——你熟悉的 Pi 命令和配置全部保留。
+      </p>
+      <div class="hero-actions">
+        <a href="https://pi.dev" target="_blank" class="btn btn-primary">了解 Pi Runtime</a>
+        <a href="https://github.com/earendil-works/pi-mono" target="_blank" class="btn btn-secondary">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"/></svg>
+          GitHub
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer>
+    <p>
+      <strong>Triple-pi</strong> · 基于 <a href="https://pi.dev" target="_blank">Pi Coding Agent</a> 构建 · 
+      <a href="https://github.com/earendil-works/pi-mono" target="_blank">GitHub</a>
+    </p>
+    <p style="margin-top: 0.4rem; font-size:0.8rem;">
+      pi.dev 域名由 <a href="https://exe.dev" target="_blank">exe.dev</a> 慷慨捐赠
+    </p>
+  </footer>
+
+</body>
+</html>
