@@ -92,10 +92,12 @@ export function registerSubagentExtension(
     name: "review_current_changes",
     label: "Review Current Changes",
     description: [
-      "自动获取当前项目 git diff，检索相关 Memory，创建 Reviewer SubAgent 审查。",
-      "无需手动传入 diff 或规则。",
+      "【必须调用】在提交代码之前，审查当前未提交的改动是否违反了项目规则。",
+      "只要项目 Memory 中存在规则（rule/decision/preference），就应在修改代码后调用此工具。",
+      "尤其在以下情况务必调用：改动涉及核心逻辑、跨多个文件、新增公共接口、修改数据库操作、变更类型定义。",
+      "工具会自动获取 git diff、检索相关 Memory、创建独立的只读 reviewer 执行审查。",
     ].join("\n"),
-    promptSnippet: "auto-review current git changes with memory-aware reviewer",
+    promptSnippet: "review changes before committing — required when project rules exist",
     parameters: Type.Object({
       task: Type.String({ description: "简要描述当前改动" }),
     }),

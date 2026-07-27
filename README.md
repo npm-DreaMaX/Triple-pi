@@ -27,7 +27,7 @@ What you get in practice:
 
 ### Project-aware Code Review
 
-Before you commit, `review_current_changes` checks your diff against your project's stored rules. The reviewer is a separate, read-only agent session — it can't modify files. You get back: which file, which line, what's wrong, how severe.
+Before you commit — or at any point — `review_current_changes` checks your working diff against your project's stored rules. You call it when you want a review. The agent can also decide to invoke it proactively. It doesn't run automatically on every keystroke; each invocation is an explicit LLM call.
 
 What you get in practice:
 
