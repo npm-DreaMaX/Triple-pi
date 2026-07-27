@@ -1,6 +1,6 @@
 # Triple-pi
 
-Persistent memory and project-aware code review for the [Pi coding agent](https://github.com/earendil-works/pi). Built as a Pi extension — does not modify runtime source.
+Persistent memory and project-aware code review for coding agents.
 
 [![CI](https://github.com/npm-DreaMaX/Triple-pi/actions/workflows/ci.yml/badge.svg)](https://github.com/npm-DreaMaX/Triple-pi/actions/workflows/ci.yml)
 [![Node](https://img.shields.io/badge/node-%3E%3D22.19.0-brightgreen)](https://nodejs.org)
@@ -10,14 +10,59 @@ Persistent memory and project-aware code review for the [Pi coding agent](https:
 
 ## What it does
 
-Two modules, one repository:
+Two modules that share one memory store.
 
-| Module | Description |
+### Persistent Memory
+
+The agent forgets everything between sessions. You re-explain conventions, re-state preferences, re-teach decisions. Triple-pi remembers for it.
+
+After each conversation, the system extracts what's worth keeping — rules, preferences, technical decisions — and saves them. Next time you open the project, the agent loads them automatically.
+
+What you get in practice:
+
+- Agent learns "this project uses pino, not console.log." It sticks.
+- You say "actually, use GraphQL instead of REST." The old rule is replaced, not duplicated.
+- You open a project you haven't touched in 35 days. The agent asks: "Restore project memory?" Your choice.
+- Working on a monorepo? Frontend rules don't leak into backend projects.
+
+### Project-aware Code Review
+
+Before you commit, `review_current_changes` checks your diff against your project's stored rules. The reviewer is a separate, read-only agent session — it can't modify files. You get back: which file, which line, what's wrong, how severe.
+
+What you get in practice:
+
+- Catches `any` types, missing transaction timeouts, console.log calls — not from a lint config, but from your project's own rules.
+- Reviewer has no write tools loaded. Not "asked to be read-only." Configured that way.
+- Diff is chunked. Large diffs report which files were covered and which were skipped.
+- If the model returns garbage, you get a parse error, not a silent "no issues found."
+
+---
+
+## Compared to Pi's built-in tools
+
+Pi ships a Memory tool and a SubAgent session API. These are the building blocks. Triple-pi uses them and adds the parts that make them trustworthy outside of demos.
+
+**Memory pipeline — 6 stages, each can reject the batch**
+
+| Pi built-in | Triple-pi |
 |---|---|
-| **Memory** | Extracts project rules, decisions and preferences from agent conversations. Injects them into future sessions so the agent remembers your project context across sessions. |
-| **Reviewer** | Spawns a read-only sub-agent to check staged and unstaged changes against your project's memory before you commit. |
+| Saves whatever the LLM outputs | Extraction → validation → review → consolidation → commit |
+| No evidence required | Evidence must be a verbatim user message substring |
+| LLM picks scope | Global downgraded to project without explicit cross-project evidence |
+| No review step | Second LLM pass: keep or remove only, cannot rewrite |
+| Overwrite on save | Immutable revision snapshots |
+| No lifecycle | 30d hot → 31-90d cold (asks) → >90d archive (rename, not delete) |
 
-Memory and Reviewer share one `FilesystemMemoryRepository` — rules you save are available to both modules.
+**Reviewer — code-level isolation, not prompt-level**
+
+| Pi built-in | Triple-pi |
+|---|---|
+| Prompt says "read only" | Session configured with noExtensions, noSkills, noContextFiles |
+| No write-tool restriction | Tool allowlist `[read, grep, find, ls]` enforced by registry |
+| No change verification | Git status + file hash snapshot before and after |
+| Raw model output | Strict schema: passed ↔ zero findings, line positive integer, etc. |
+| Full diff in prompt | Chunked by file/hunk; partial coverage tracked |
+| No memory integration | Multi-keyword OR-search from diff content |
 
 ---
 
@@ -26,128 +71,48 @@ Memory and Reviewer share one `FilesystemMemoryRepository` — rules you save ar
 ```bash
 git clone --recurse-submodules https://github.com/npm-DreaMaX/Triple-pi.git
 cd Triple-pi
-npm run setup          # Build Pi, install deps, symlink the extension
+npm run setup
 ```
 
-Requires Node.js `>=22.19.0`.
-
-`npm run setup` installs `extensions/` into Pi's agent directory as the `triple-pi` extension. The extension registers `SaveMemory`, `SearchMemory`, `delegate_review`, and `review_current_changes` tools. It also hooks into `agent_settled` (auto-extraction) and `before_agent_start` (memory injection).
-
----
+Node.js `>=22.19.0`.
 
 ## Verify
 
 ```bash
-npm run typecheck      # TypeScript strict mode
-npm test               # 178 deterministic tests (no network, no LLM)
-npm run eval:recorded   # 46 full-pipeline tests with mock LLM
-npm run demo            # Offline end-to-end smoke test
-```
-
-Live evaluation against real models is opt-in:
-
-```bash
-TRIPLE_PI_EVAL_MODEL=<provider>/<model> npm run eval:live
+npm run typecheck
+npm test               # 178 tests, 0 network, 0 LLM
+npm run eval:recorded   # 46 full-pipeline tests
+npm run demo            # Offline smoke test
 ```
 
 ---
 
-## What this project adds on top of Pi
+## Evaluation
 
-Pi ships with a Memory tool (file I/O for a `/memories` directory) and SubAgent session templates. They work for demos.
+Three layers, different goals.
 
-This project adds the parts that make them usable outside of demos:
-
-- **Extraction pipeline.** Pi's stock Memory tool saves whatever the agent asks it to save. Triple-pi adds a 6-stage automatic extraction pipeline (redact → extract → validate → review → consolidate → commit). Each stage can reject the batch. If any stage fails, nothing is written.
-- **Evidence grounding.** Every automatically extracted record carries a `provenance.evidence` field — a verbatim quote from a user message. The LLM cannot fabricate evidence. Assistant text is never accepted as a source.
-- **Deterministic scope resolution.** A candidate marked `global` by the LLM is downgraded to `project` unless the user's quoted evidence explicitly states cross-project intent. No extra confirmation dialog, no user interruption — the code decides.
-- **Grounded review.** A second LLM call reviews extraction candidates. It can only keep or remove them. It cannot rewrite titles, content, or evidence. The schema is enforced — any attempt to modify a field causes rejection.
-- **Immutable revision history.** Every update to a record saves the prior version to `revisions/`. The chain is a proper linked list (`previousRevisionId` links to the prior snapshot), not a self-referencing pointer.
-- **Lifecycle state machine.** 0-30 days hot, 31-90 days cold (asks before injecting), >90 days auto-archived (renamed, not deleted). Project isolation is based on `realpath(cwd)`, not git remote, so monorepo subdirectories are naturally separate.
-- **Branch-safe extraction.** The scheduler tracks `generation + sessionId + branchLeafId` per job. A checkpoint from a discarded branch cannot commit to the current tree.
-- **Reviewer isolation through ResourceLoader, not prompts.** The reviewer session is created with `noExtensions: true`, `noSkills: true`, `noContextFiles: true`. Only `read`, `grep`, `find`, `ls` are loaded. Pi's tool registry enforces the allowlist — the model cannot request a write tool because none exists in the session.
-- **Worktree snapshot verification.** Git status and file hashes are captured before and after the review. If they differ, the result is `worktree-changed`, not a silent "no files modified."
-- **Strict output schema.** `passed` requires zero findings. `issues_found` requires at least one. `description` must be non-empty. `line` must be a positive integer. Severity must be `low | medium | high`. JSON parse failure and schema violation are distinct outcomes and never reported as "no issues found."
-- **Chunked diff review with partial coverage tracking.** Files are chunked by hunk. If the diff exceeds the budget, skipped files are recorded explicitly. The result carries a `coverage` field (`complete` or `partial`). Nothing is silently dropped.
-- **Three-layer eval with exit-code semantics.** 178 deterministic tests (0 network, 0 LLM) run on every push. 46 recorded full-pipeline tests verify wiring with mock LLM. Live eval is opt-in and exits 2 on infrastructure failure, 1 on semantic mismatch, 0 on all-pass. A noise case does not "pass" because the repository happened to be empty after a crash.
-
----
-
-## Storage layout
-
-```
-~/.triple-pi/memory-v1/
-├── global/entries/                 # Shared across all projects
-├── projects/<id>/entries/          # Per-project records
-├── projects/<id>/revisions/        # Immutable record history
-├── projects/<id>/working/          # Scratchpad and daily timeline
-├── archive/projects/<id>/          # Auto-archived after 90 days of inactivity
-├── extractions/<project-id>/       # Idempotent source manifests
-└── signals/<project-id>/           # Reinforcement state
-```
-
-Project identity is derived from `realpath(cwd)`. To share memory across different clone paths, drop a `.triple-pi/project.json` with a stable `projectId` in the project root.
-
----
-
-## Lifecycle
-
-| Inactivity | State | Behavior |
+| Layer | Runs | Validates |
 |---|---|---|
-| 0–30 days | hot | Memory injected normally. Activity marker refreshed on each session. |
-| 31–90 days | cold | On next session start, asks whether to restore project memory. If declined, project memory stays cold this session; global memory remains visible. |
-| >90 days | archive-due | On next session start, the project directory is atomically renamed into `archive/`. A notification is shown. Restorable with `/memory-restore`. |
+| 178 deterministic tests | Every push, 0 LLM | Code logic: parsing, locking, validation, scheduling |
+| 46 recorded pipeline tests | Every push, mock LLM | End-to-end wiring: extraction through commit |
+| Live eval | Opt-in, model required | Model quality: precision, recall, noise rejection |
 
-Archived projects reject writes. Global records and manual saves are never archived.
-
----
-
-## Project structure
-
-```
-extensions/
-├── index.ts                  # Unified entry point
-├── memory/
-│   ├── index.ts              # Extension lifecycle, tools, hooks
-│   ├── repository.ts         # Locking, atomic I/O, search, revisions
-│   ├── domain.ts             # Shared types
-│   ├── project-identity.ts   # cwd → project ID resolution
-│   ├── validation.ts         # Manual and automatic write validation
-│   ├── working-state.ts      # Session working state management
-│   └── extraction/           # Automatic extraction pipeline
-└── subagent/
-    ├── index.ts              # Reviewer tool registration
-    ├── manager.ts            # Session creation, timeout, cleanup
-    ├── review-core.ts        # Git diff collection, search, chunking, parsing
-    └── types.ts              # Discriminated result types
-
-eval/     # Evaluation harness (3-layer)
-docs/     # Design docs, interview prep, demo runbook
-test/     # 21 files, 178 tests
-scripts/  # Installer, status diagnostics, demo
-```
+Live eval exit codes: 2 = infra failure, 1 = semantic mismatch, 0 = pass.
 
 ---
 
 ## Limitations
 
-- Search is keyword-based (substring match on title + content). No semantic or vector retrieval.
-- Secret redaction covers common patterns (AWS, GitHub, JWT, Bearer, private keys) but not arbitrary custom formats.
-- Single-user. No shared or multi-tenant memory.
-- File writes use `temp + rename` for atomic visibility, not `fsync`. A power loss during write may lose the in-flight record.
+- Keyword search, no semantic retrieval
+- Secret redaction: 10 patterns, not custom formats
+- Single-user, no shared memory
+- `temp → rename` = atomic visibility, not `fsync` durability
 
 ---
 
 ## Docs
 
-| | |
-|---|---|
-| [Memory design](./docs/design/memory.md) | Identity, scope, lifecycle, extraction pipeline |
-| [Reviewer design](./docs/design/reviewer.md) | Wiring, diff collection, retrieval, chunking, isolation |
-| [Evaluation](./docs/evaluation.md) | Three-layer validation, metrics, evidence contracts |
-| [Demo runbook](./docs/demo.md) | Offline end-to-end smoke test |
-| [Interview prep](./docs/interview.md) | Common questions, STAR stories, bug stories |
-| [History](./docs/history/MEMORY_REBUILD.md) | Design iteration log (historical, not current) |
+[Memory design](./docs/design/memory.md) · [Reviewer design](./docs/design/reviewer.md) · [Evaluation](./docs/evaluation.md) · [Demo](./docs/demo.md) · [Interview prep](./docs/interview.md) · [History](./docs/history/MEMORY_REBUILD.md)
 
 ## License
 
