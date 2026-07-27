@@ -1,7 +1,7 @@
 <p align="center">
   <b>Triple-pi</b>
   <br/>
-  Persistent memory and project-aware code review for coding agents.
+  A Pi-based coding agent with persistent memory and project-aware code review.
 </p>
 
 <p align="center">
