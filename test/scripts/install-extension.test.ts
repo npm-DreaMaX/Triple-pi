@@ -17,23 +17,42 @@ async function install() {
 }
 
 describe("extension installer", () => {
-  it("installs and is idempotent in a custom Pi agent dir", async () => {
+  it("installs unified extension and is idempotent", async () => {
     await install();
-    const target = path.join(agentDir, "extensions", "memory");
-    expect((await fs.lstat(target)).isSymbolicLink()).toBe(true);
+
+    // Unified extension should be installed at extensions/triple-pi
+    const unifiedTarget = path.join(agentDir, "extensions", "triple-pi");
+    expect((await fs.lstat(unifiedTarget)).isSymbolicLink()).toBe(true);
+
+    // Idempotent
     await expect(install()).resolves.toMatchObject({ stdout: expect.stringContaining("already installed") });
   });
 
   it("replaces a broken symlink", async () => {
-    const target = path.join(agentDir, "extensions", "memory");
-    await fs.mkdir(path.dirname(target), { recursive: true });
-    await fs.symlink(path.join(agentDir, "missing"), target);
+    const unifiedTarget = path.join(agentDir, "extensions", "triple-pi");
+    await fs.mkdir(path.dirname(unifiedTarget), { recursive: true });
+    await fs.symlink(path.join(agentDir, "missing"), unifiedTarget);
     await install();
-    expect(await fs.realpath(target)).toBe(await fs.realpath(path.resolve("extensions/memory")));
+    expect(await fs.realpath(unifiedTarget)).toBe(await fs.realpath(path.resolve("extensions")));
   });
 
   it("refuses to overwrite a regular directory", async () => {
-    await fs.mkdir(path.join(agentDir, "extensions", "memory"), { recursive: true });
+    await fs.mkdir(path.join(agentDir, "extensions", "triple-pi"), { recursive: true });
     await expect(install()).rejects.toMatchObject({ code: 1 });
+  });
+
+  it("migrates legacy memory-only symlink to unified extension", async () => {
+    // Create legacy memory symlink pointing to our project
+    const legacyMemory = path.join(agentDir, "extensions", "memory");
+    await fs.mkdir(path.dirname(legacyMemory), { recursive: true });
+    await fs.symlink(path.resolve("extensions/memory"), legacyMemory);
+
+    await install();
+
+    // Legacy should be removed
+    await expect(fs.lstat(legacyMemory)).rejects.toThrow("ENOENT");
+    // Unified should be installed
+    const unifiedTarget = path.join(agentDir, "extensions", "triple-pi");
+    expect((await fs.lstat(unifiedTarget)).isSymbolicLink()).toBe(true);
   });
 });

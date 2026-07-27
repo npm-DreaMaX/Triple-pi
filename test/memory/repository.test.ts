@@ -77,7 +77,7 @@ describe("FilesystemMemoryRepository", () => {
       cwd: projectA,
       title: "Bad category",
       content: "Must not escape.",
-    })).rejects.toThrow("Invalid memory category");
+    })).rejects.toThrow("无效分类");
     expect(await repository.list(projectA)).toEqual([]);
   });
 

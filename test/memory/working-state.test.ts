@@ -33,9 +33,9 @@ describe("working state", () => {
 
   it("redacts secrets before persistence", () => {
     const secret = { ...source, messages: [{ ...source.messages[0], content: "api_key=super-secret-token-value" }, source.messages[1]] };
-    expect(buildWorkingStateUpdate(secret, "session-1", new Date())!.currentRequest).toBe("[REDACTED_SECRET]");
+    expect(buildWorkingStateUpdate(secret, "session-1", new Date())!.userRequest).toBe("[REDACTED_SECRET]");
     const quoted = { ...source, messages: [{ ...source.messages[0], content: 'PASSWORD="correct horse battery staple"' }, source.messages[1]] };
-    expect(buildWorkingStateUpdate(quoted, "session-1", new Date())!.currentRequest).toBe("[REDACTED_SECRET]");
+    expect(buildWorkingStateUpdate(quoted, "session-1", new Date())!.userRequest).toBe("[REDACTED_SECRET]");
   });
 
   it("writes scratchpad and rolls daily files by date", async () => {

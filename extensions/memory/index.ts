@@ -1,20 +1,23 @@
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { isMemoryCategory, MEMORY_CATEGORIES, type MemoryScope } from "./domain.ts";
+import { isMemoryCategory, MEMORY_CATEGORIES, type MemoryCategory, type MemoryScope } from "./domain.ts";
 import {
   createMemoryRepository,
   type FilesystemMemoryRepository,
 } from "./repository.ts";
 import { runExtraction, type ExtractionSnapshot } from "./extraction/coordinator.ts";
+import { ExtractionScheduler } from "./extraction/scheduler.ts";
 import { findCheckpoint, MEMORY_CHECKPOINT_TYPE } from "./extraction/source.ts";
 import {
   buildWorkingSource,
   buildWorkingStateUpdate,
   findWorkingCheckpoint,
+  parseWorkingCheckpoint,
   renderScratchpad,
   WORKING_CHECKPOINT_TYPE,
   type WorkingStateUpdate,
 } from "./working-state.ts";
+import { validateMemoryWrite, describeRejection } from "./validation.ts";
 
 // ═══════════════════════════════════════════════════════════════
 // Per-extension-instance session state
@@ -27,7 +30,7 @@ class SessionState {
   readonly hot = new Set<string>();
   /** Projects whose memory is cold (blocked) this session. */
   readonly cold = new Set<string>();
-  /** Per-branch working state carried forward from checkpoints. */
+  /** Per-branch working state carried forward from deep-validated checkpoints. */
   readonly branchWorking = new Map<string, WorkingStateUpdate>();
 
   isHot(projectId: string): boolean {
@@ -55,91 +58,10 @@ class SessionState {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Extraction scheduler
+// Working context type for message injection
 // ═══════════════════════════════════════════════════════════════
 
-class ExtractionScheduler {
-  private task: Promise<void> | undefined;
-  private abort: AbortController | undefined;
-  private generation = 0;
-  private pending: ExtractionSnapshot | undefined;
-
-  /** Start extraction; queue if one is already running. */
-  start(
-    snapshot: ExtractionSnapshot,
-    repository: FilesystemMemoryRepository,
-    appendCheckpoint: (checkpoint: Parameters<typeof runExtraction>[1] extends { signal: any } ? never : any) => void,
-    onSettled: () => void,
-  ): void {
-    const gen = this.generation;
-    if (this.task || this.abort) {
-      // An extraction is in-flight: stash the latest snapshot and let the
-      // running task's .finally() pick it up.
-      this.pending = snapshot;
-      return;
-    }
-    const controller = new AbortController();
-    this.abort = controller;
-    this.task = runExtraction(repository, snapshot, controller.signal)
-      .then((result) => {
-        // Only commit the checkpoint when:
-        //  1. The generation hasn't been bumped (no tree switch / shutdown).
-        //  2. The abort hasn't been signalled.
-        if (result.checkpoint && gen === this.generation && !controller.signal.aborted) {
-          // Snapshot the lastProcessedEntryId before appending so the pending
-          // snapshot (if any) carries forward the right offset.
-          if (this.pending?.sessionId === snapshot.sessionId) {
-            this.pending.lastProcessedEntryId = result.checkpoint.lastEntryId;
-          }
-          appendCheckpoint(result.checkpoint);
-        }
-      })
-      .catch(() => {
-        // Extraction is fail-closed. A failed run never advances the
-        // checkpoint so the delta is re-processed on the next settled event.
-      })
-      .finally(() => {
-        // Clear the in-flight task first so the pending re-dispatch below
-        // sees a free slot.
-        if (this.abort === controller) this.abort = undefined;
-        this.task = undefined;
-        const next = this.pending;
-        this.pending = undefined;
-        onSettled();
-        if (next) this.start(next, repository, appendCheckpoint, onSettled);
-      });
-  }
-
-  /** Cancel in-flight extraction and increment generation. */
-  cancel(): void {
-    this.generation += 1;
-    this.abort?.abort();
-    this.pending = undefined;
-  }
-
-  /** Increment generation (for tree switches) without clearing pending. */
-  bumpGeneration(): void {
-    this.generation += 1;
-    this.abort?.abort();
-  }
-
-  /** Flush and wait up to 1s for shutdown. */
-  async shutdown(): Promise<void> {
-    this.generation += 1;
-    this.pending = undefined;
-    this.abort?.abort();
-    if (this.task) {
-      await Promise.race([
-        this.task,
-        new Promise<void>((resolve) => setTimeout(resolve, 1_000)),
-      ]);
-    }
-  }
-
-  get isRunning(): boolean {
-    return this.task !== undefined;
-  }
-}
+const WORKING_CONTEXT_TYPE = "triple-pi-working-context";
 
 // ═══════════════════════════════════════════════════════════════
 // Extension entry point
@@ -172,25 +94,29 @@ export function registerMemoryExtension(
       })),
     }),
     async execute(_id, params, signal, _onUpdate, ctx) {
-      const { category, title, content, scope } = params as {
+      const { category, title, content, scope: rawScope } = params as {
         category: string;
         title: string;
         content: string;
         scope?: string;
       };
 
-      if (!isMemoryCategory(category)) {
+      // Normalize scope: undefined → "project", "project" → "project",
+      // "global" → "global", anything else → "invalid-scope"
+      const scope: string = rawScope === "global" ? "global" : rawScope === "project" ? "project" : "project";
+
+      // Run validateMemoryWrite — fail closed before confirm if secret/overflow
+      const validated = validateMemoryWrite(
+        { category, title, content, scope },
+        { source: "manual" },
+      );
+      if ("kind" in validated) {
         return {
-          content: [{ type: "text", text: `无效分类"${category}"。有效值：${MEMORY_CATEGORIES.join(", ")}` }],
-          details: { saved: false, reason: "invalid-category" },
+          content: [{ type: "text", text: describeRejection(validated) }],
+          details: { saved: false, reason: validated.kind },
         };
       }
-      if (!title.trim() || !content.trim()) {
-        return {
-          content: [{ type: "text", text: "标题和内容不能为空。" }],
-          details: { saved: false, reason: "empty-input" },
-        };
-      }
+
       if (!ctx.hasUI) {
         return {
           content: [{ type: "text", text: "当前模式无法显示确认框，未保存记忆。" }],
@@ -198,7 +124,7 @@ export function registerMemoryExtension(
         };
       }
 
-      const normalizedScope: MemoryScope = scope === "global" ? "global" : "project";
+      const normalizedScope: MemoryScope = validated.scope;
       const lifecycle = await repository.getProjectLifecycle(ctx.cwd);
       if (normalizedScope === "project" && (
         lifecycle.state === "cold" ||
@@ -215,10 +141,10 @@ export function registerMemoryExtension(
         "保存长期记忆？",
         [
           `作用域：${normalizedScope}`,
-          `分类：${category}`,
-          `标题：${title.trim()}`,
+          `分类：${validated.category}`,
+          `标题：${validated.title}`,
           "",
-          content.trim(),
+          validated.content,
         ].join("\n"),
         { signal },
       );
@@ -231,9 +157,9 @@ export function registerMemoryExtension(
 
       try {
         const record = await repository.save({
-          category,
-          title,
-          content,
+          category: validated.category as MemoryCategory,
+          title: validated.title,
+          content: validated.content,
           scope: normalizedScope,
           cwd: ctx.cwd,
           provenance: {
@@ -340,7 +266,17 @@ export function registerMemoryExtension(
   pi.on("session_start", async (_event, ctx) => {
     const branchCheckpoint = findWorkingCheckpoint(ctx.sessionManager.getBranch());
     if (branchCheckpoint?.state) {
-      state.branchWorking.set(ctx.sessionManager.getSessionId(), branchCheckpoint.state);
+      // Deep-validate the checkpoint state before using it
+      try {
+        const validated = parseWorkingCheckpoint({ ...branchCheckpoint, state: branchCheckpoint.state });
+        if (validated.state) {
+          state.branchWorking.set(ctx.sessionManager.getSessionId(), validated.state);
+        } else {
+          state.branchWorking.delete(ctx.sessionManager.getSessionId());
+        }
+      } catch {
+        state.branchWorking.delete(ctx.sessionManager.getSessionId());
+      }
     } else {
       state.branchWorking.delete(ctx.sessionManager.getSessionId());
     }
@@ -389,32 +325,78 @@ export function registerMemoryExtension(
     const includeProject = (
       lifecycle.state === "hot" || state.hot.has(lifecycle.project.id)
     ) && !state.isCold(lifecycle.project.id);
+
+    // Cold/archived projects get no working state injection
+    const injectWorking = includeProject && lifecycle.state !== "archived" && !state.isCold(lifecycle.project.id);
+
     const branchState = state.branchWorking.get(ctx.sessionManager.getSessionId());
     const contextWindow = ctx.model?.contextWindow || 32_000;
     const workingCharBudget = Math.max(1_000, Math.min(8_000, Math.floor(contextWindow * 0.2)));
     const memoryCharBudget = Math.max(2_000, Math.min(12_000, Math.floor(contextWindow * 0.3)));
     const [memory, storedWorking] = await Promise.all([
       repository.buildPrompt(ctx.cwd, { includeProject, maxChars: memoryCharBudget }),
-      repository.loadWorkingState(ctx.cwd, includeProject && !branchState),
+      injectWorking && !branchState
+        ? repository.loadWorkingState(ctx.cwd, true)
+        : Promise.resolve({ scratchpad: "", recentDaily: "", project: lifecycle.project }),
     ]);
     const working = branchState
       ? { scratchpad: renderScratchpad(branchState), recentDaily: "", project: lifecycle.project }
       : storedWorking;
     working.scratchpad = working.scratchpad.slice(0, Math.floor(workingCharBudget * 0.6));
     working.recentDaily = working.recentDaily.slice(-Math.floor(workingCharBudget * 0.4));
-    const workingPrompt = working.scratchpad || working.recentDaily
-      ? [
-          "## Working State",
-          "",
-          "This is recent, temporary project state. Do not treat it as durable truth or automatically promote it to long-term memory.",
-          working.scratchpad ? `\n### Scratchpad\n\n${working.scratchpad}` : "",
-          working.recentDaily ? `\n### Recent Daily\n\n${working.recentDaily}` : "",
-        ].join("\n")
-      : "";
-    if (!memory.prompt && !workingPrompt) return;
-    return {
-      systemPrompt: [event.systemPrompt, memory.prompt, workingPrompt].filter(Boolean).join("\n\n"),
-    };
+
+    // Build the prompt modifications
+    const result: { systemPrompt?: string; messages?: any[] } = {};
+
+    // Always include persistent memory prompt in system prompt
+    if (memory.prompt) {
+      result.systemPrompt = [event.systemPrompt, memory.prompt].filter(Boolean).join("\n\n");
+    } else {
+      result.systemPrompt = event.systemPrompt;
+    }
+
+    // Inject Working State as a hidden custom/user message (not in systemPrompt).
+    // This makes it available to the agent without polluting system prompt attribution.
+    if (injectWorking) {
+      const workingScratchpad = working.scratchpad || "";
+      const workingDaily = working.recentDaily || "";
+      const workingPrompt = workingScratchpad || workingDaily
+        ? [
+            "## Working State (derived, temporary, untrusted)",
+            "",
+            "This is recent, temporary project state derived from the current conversation.",
+            "Do not treat it as durable truth or automatically promote it to long-term memory.",
+            "It is NOT verified and may contain inaccuracies or speculation.",
+            workingScratchpad ? `\n### Scratchpad\n\n${workingScratchpad}` : "",
+            workingDaily ? `\n### Recent Daily\n\n${workingDaily}` : "",
+          ].join("\n")
+        : "";
+
+      if (workingPrompt) {
+        // Filter out old working context messages to avoid accumulation
+        const existingMessages = (event as any).messages || [];
+        const filteredMessages = existingMessages.filter(
+          (msg: any) => !(msg.customType === WORKING_CONTEXT_TYPE),
+        );
+
+        result.messages = [
+          ...filteredMessages,
+          {
+            type: "custom",
+            customType: WORKING_CONTEXT_TYPE,
+            data: {
+              content: workingPrompt,
+              updatedAt: working.scratchpad ? new Date().toISOString() : undefined,
+              derived: true,
+              temporary: true,
+              untrusted: true,
+            },
+          },
+        ];
+      }
+    }
+
+    return Object.keys(result).length > 0 ? result : undefined;
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
@@ -430,18 +412,29 @@ export function registerMemoryExtension(
         new Date(),
       );
       if (update) {
-        try {
-          await repository.saveWorkingState(ctx.cwd, update);
-          state.branchWorking.set(ctx.sessionManager.getSessionId(), update);
-          pi.appendEntry(WORKING_CHECKPOINT_TYPE, {
-            version: update.version,
-            sourceHash: update.sourceHash,
-            lastEntryId: update.lastEntryId,
-            branchLeafId: update.branchLeafId,
-            state: update,
-          });
-        } catch {
-          // Working state is derived and must not block long-term extraction.
+        // Validate working state content — don't persist if it contains secrets
+        const validated = validateMemoryWrite(
+          {
+            category: "knowledge",
+            title: "Working State",
+            content: `${update.userRequest}\n\n${update.assistantReportedOutcome}`,
+          },
+          { source: "extraction" },
+        );
+        if (!("kind" in validated)) {
+          try {
+            await repository.saveWorkingState(ctx.cwd, update);
+            state.branchWorking.set(ctx.sessionManager.getSessionId(), update);
+            pi.appendEntry(WORKING_CHECKPOINT_TYPE, {
+              version: update.version,
+              sourceHash: update.sourceHash,
+              lastEntryId: update.lastEntryId,
+              branchLeafId: update.branchLeafId,
+              state: update,
+            });
+          } catch {
+            // Working state is derived and must not block long-term extraction.
+          }
         }
       }
     }
@@ -465,8 +458,19 @@ export function registerMemoryExtension(
     scheduler.bumpGeneration();
     const checkpoint = findWorkingCheckpoint(ctx.sessionManager.getBranch());
     if (checkpoint?.state) {
-      state.branchWorking.set(ctx.sessionManager.getSessionId(), checkpoint.state);
-      await repository.setWorkingLatest(ctx.cwd, checkpoint.state);
+      try {
+        const validated = parseWorkingCheckpoint({ ...checkpoint, state: checkpoint.state });
+        if (validated.state) {
+          state.branchWorking.set(ctx.sessionManager.getSessionId(), validated.state);
+          await repository.setWorkingLatest(ctx.cwd, validated.state);
+        } else {
+          state.branchWorking.delete(ctx.sessionManager.getSessionId());
+          await repository.setWorkingLatest(ctx.cwd);
+        }
+      } catch {
+        state.branchWorking.delete(ctx.sessionManager.getSessionId());
+        await repository.setWorkingLatest(ctx.cwd);
+      }
     } else {
       state.branchWorking.delete(ctx.sessionManager.getSessionId());
       await repository.setWorkingLatest(ctx.cwd);

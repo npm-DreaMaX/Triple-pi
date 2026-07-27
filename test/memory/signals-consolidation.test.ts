@@ -15,7 +15,7 @@ const messages = [{ entryId: "u1", role: "user" as const, content: candidate.evi
 
 function record(overrides: Partial<MemoryRecord> = {}): MemoryRecord {
   return {
-    schemaVersion: 1, id: "existing", category: "rule", scope: "project", projectId: "project",
+    schemaVersion: 2, id: "existing", category: "rule", scope: "project", projectId: "project",
     title: candidate.title, content: candidate.content, createdAt: "2026-01-01", updatedAt: "2026-01-01",
     provenance: { source: "extraction", fingerprint: semanticFingerprint(candidate) }, ...overrides,
   };

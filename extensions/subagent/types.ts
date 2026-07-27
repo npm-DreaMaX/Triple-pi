@@ -7,6 +7,29 @@
 
 export type SubagentRole = "reviewer";
 
+export type ReviewFindingSeverity = "low" | "medium" | "high";
+export type ReviewStatus = "passed" | "issues_found";
+
+export type ReviewerFailureKind =
+  | "git-failed"
+  | "session-create-failed"
+  | "provider-failed"
+  | "parse-failed"
+  | "schema-failed"
+  | "timeout"
+  | "aborted"
+  | "worktree-changed"
+  | "no-changes";
+
+export type ReviewCoverage = "partial" | "complete";
+
+export interface ReviewerTelemetry {
+  totalChunks: number;
+  parsedChunks: number;
+  failedChunks: number;
+  worktreeChanged: boolean;
+}
+
 export interface SubagentTask {
   id: string;
   role: SubagentRole;
@@ -21,20 +44,21 @@ export interface SubagentTask {
 }
 
 export interface ReviewFinding {
-  severity: "low" | "medium" | "high";
+  severity: ReviewFindingSeverity;
   file?: string;
   line?: number;
   description: string;
 }
 
 export interface ReviewResult {
-  status: "passed" | "issues_found" | "failed" | "timeout";
+  status: ReviewStatus | "failed" | "timeout";
   summary: string;
   findings: ReviewFinding[];
 }
 
 export interface SubagentResult {
   taskId: string;
+  /** 兼容旧 status 字段 */
   status: "success" | "failed" | "timeout";
   summary: string;
   findings: ReviewFinding[];
@@ -43,4 +67,65 @@ export interface SubagentResult {
   durationMs: number;
   toolCalls: number;
   error?: string;
+
+  // ═════════════════════════════════════════════════════════════
+  // 新字段（V2）
+  // ═════════════════════════════════════════════════════════════
+
+  /** 失败的具体原因（仅在 status 为 failed/timeout 时有意义） */
+  failureKind?: ReviewerFailureKind;
+  /** 审查覆盖率 */
+  coverage?: ReviewCoverage;
+  /** 遥测信息 */
+  telemetry?: ReviewerTelemetry;
+}
+
+/**
+ * 判别联合结果类型，Manager.review() 的主返回值
+ */
+export type ReviewResultUnion =
+  | { kind: "no-changes"; message: string }
+  | { kind: "success"; result: SubagentResult }
+  | { kind: "partial"; result: SubagentResult }
+  | { kind: "git-failed"; error: string }
+  | { kind: "session-create-failed"; error: string }
+  | { kind: "provider-failed"; error: string }
+  | { kind: "parse-failed"; error: string; raw: string }
+  | { kind: "schema-failed"; error: string; raw: string }
+  | { kind: "timeout" }
+  | { kind: "aborted" }
+  | { kind: "worktree-changed" };
+
+/**
+ * Git 变更文件描述
+ */
+export interface ChangeFile {
+  path: string;
+  status: "staged" | "unstaged" | "untracked";
+  diff: string;
+  content?: string;
+  binary: boolean;
+  unreadable: boolean;
+  skipped: boolean;
+}
+
+/**
+ * Review chunk — 单个 LLM 请求的输入分片
+ */
+export interface ReviewChunk {
+  chunkId: string;
+  files: string[];
+  content: string;
+  charCount: number;
+}
+
+/**
+ * Review input — 构建单个 prompt 的输入
+ */
+export interface ReviewInput {
+  task: string;
+  diff: string;
+  memory?: string;
+  changes: ChangeFile[];
+  chunks: ReviewChunk[];
 }

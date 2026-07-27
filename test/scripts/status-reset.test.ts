@@ -12,7 +12,7 @@ beforeEach(async () => {
   home = await fs.mkdtemp(path.join(os.tmpdir(), "triple-pi-ops-"));
   agentDir = path.join(home, "agent");
   await fs.mkdir(path.join(agentDir, "extensions"), { recursive: true });
-  await fs.symlink(path.resolve("extensions/memory"), path.join(agentDir, "extensions", "memory"));
+  await fs.symlink(path.resolve("extensions"), path.join(agentDir, "extensions", "triple-pi"));
 });
 afterEach(async () => fs.rm(home, { recursive: true, force: true }));
 

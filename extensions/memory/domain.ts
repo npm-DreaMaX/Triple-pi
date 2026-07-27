@@ -1,4 +1,5 @@
-export const MEMORY_SCHEMA_VERSION = 1;
+/** Per-record schema version (may differ from storage layout version). */
+export const MEMORY_RECORD_SCHEMA_VERSION = 2;
 
 export const MEMORY_CATEGORIES = [
   "preference",
@@ -12,8 +13,9 @@ export type MemoryCategory = (typeof MEMORY_CATEGORIES)[number];
 export type MemoryScope = "global" | "project";
 export type ProjectMemoryStatus = "active" | "archived";
 
+// ── Project metadata (separate version from records) ──────────────
 export interface ProjectMemoryMetadata {
-  schemaVersion: typeof MEMORY_SCHEMA_VERSION;
+  schemaVersion: number;
   projectId: string;
   displayName: string;
   cwd: string;
@@ -22,6 +24,32 @@ export interface ProjectMemoryMetadata {
   archivedAt?: string;
 }
 
+// ── Evidence & scope decision ─────────────────────────────────────
+export interface MemoryEvidence {
+  quote: string;
+  sourceEntryId: string;
+  role: "user";
+  quoteHash: string;
+}
+
+export interface ScopeDecision {
+  requested: MemoryScope;
+  resolved: MemoryScope;
+  reason:
+    | "user-confirmed-manual"
+    | "explicit-cross-project-evidence"
+    | "missing-cross-project-evidence"
+    | "default-project";
+  evidence?: MemoryEvidence;
+}
+
+// ── Revision pointer ──────────────────────────────────────────────
+export interface RevisionPointer {
+  revisionId: string;
+  previousRevisionId?: string;
+}
+
+// ── Provenance ────────────────────────────────────────────────────
 export interface MemoryProvenance {
   source: "manual" | "extraction";
   sessionId?: string;
@@ -31,11 +59,19 @@ export interface MemoryProvenance {
   score?: number;
   reinforcement?: number;
   correction?: boolean;
+  /** Evidence quote(s) that grounded this record. Present for extraction records, absent for manual. */
+  evidence?: MemoryEvidence[];
+  /** Scope decision for automatic extraction records. */
+  scopeDecision?: ScopeDecision;
+  /** Immutable revision chain pointer. */
+  revision?: RevisionPointer;
+  /** @deprecated Use revision.previousRevisionId instead. */
   revisionOf?: string;
 }
 
+// ── Record ────────────────────────────────────────────────────────
 export interface MemoryRecord {
-  schemaVersion: typeof MEMORY_SCHEMA_VERSION;
+  schemaVersion: typeof MEMORY_RECORD_SCHEMA_VERSION;
   id: string;
   category: MemoryCategory;
   scope: MemoryScope;
@@ -47,10 +83,36 @@ export interface MemoryRecord {
   provenance: MemoryProvenance;
 }
 
+// ── V1 compatibility (for reading old records) ────────────────────
+export interface MemoryRecordV1 {
+  schemaVersion: 1;
+  id: string;
+  category: MemoryCategory;
+  scope: MemoryScope;
+  projectId: string;
+  title: string;
+  content: string;
+  createdAt: string;
+  updatedAt: string;
+  provenance: Omit<MemoryProvenance, "evidence" | "scopeDecision" | "revision">;
+}
+
 export interface MemorySearchResult {
   record: MemoryRecord;
   snippet: string;
   archived: boolean;
+}
+
+// ── Revision ──────────────────────────────────────────────────────
+export interface MemoryRevision {
+  schemaVersion: 2;
+  revisionId: string;
+  recordId: string;
+  title: string;
+  content: string;
+  provenance: MemoryProvenance;
+  createdAt: string;
+  capturedAt: string;
 }
 
 export function isMemoryCategory(value: string): value is MemoryCategory {

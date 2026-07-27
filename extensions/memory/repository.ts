@@ -6,10 +6,12 @@ import * as path from "node:path";
 import { lock } from "proper-lockfile";
 import {
   isMemoryCategory,
-  MEMORY_SCHEMA_VERSION,
+  MEMORY_RECORD_SCHEMA_VERSION,
   type MemoryCategory,
   type MemoryProvenance,
   type MemoryRecord,
+  type MemoryRecordV1,
+  type MemoryRevision,
   type MemoryScope,
   type MemorySearchResult,
   type ProjectMemoryMetadata,
@@ -18,10 +20,12 @@ import { resolveProjectIdentity, type ProjectIdentity } from "./project-identity
 import {
   DAILY_MAX_CHARS,
   SCRATCHPAD_MAX_CHARS,
+  parseWorkingLatest,
   renderDailyEntry,
   renderScratchpad,
   type WorkingStateUpdate,
 } from "./working-state.ts";
+import { containsSecret, describeRejection, validateMemoryWrite } from "./validation.ts";
 
 const RECORD_START = "<!-- triple-pi-memory";
 const RECORD_END = "-->";
@@ -61,6 +65,26 @@ export interface MemoryDiagnostics {
   extractionManifestCount: number;
   workingManifestCount: number;
   permissions: string;
+  /** Whether extraction is currently running for this project. */
+  extractionRunning: boolean;
+  /** Whether extraction has a pending (queued) run. */
+  extractionPending: boolean;
+  /** ISO timestamp of the last extraction attempt (any outcome). */
+  lastExtractionAttemptAt?: string;
+  /** ISO timestamp of the last successful extraction. */
+  lastExtractionSuccessAt?: string;
+  /** ISO timestamp of the last failed extraction. */
+  lastExtractionFailureAt?: string;
+  /** Stage at which the last extraction failure occurred. */
+  lastExtractionFailureStage?: string;
+  /** Error code of the last extraction failure. */
+  lastExtractionFailureCode?: string;
+  /** Consecutive extraction failures (resets on success). */
+  consecutiveExtractionFailures: number;
+  /** Number of records that were too corrupt to read. */
+  corruptRecordCount: number;
+  /** Number of batch-commit rollback failures. */
+  rollbackFailureCount: number;
 }
 
 export interface WorkingStateView {
@@ -121,20 +145,102 @@ function serializeRecord(record: MemoryRecord): string {
   return `${RECORD_START}\n${metadata}\n${RECORD_END}\n\n# ${record.title}\n\n${record.content.trim()}\n`;
 }
 
-function parseRecord(raw: string, filepath: string): MemoryRecord {
+function parseRecord(raw: string, filepath: string, diagnostics?: { corruptRecordCount: number }): MemoryRecord {
   if (!raw.startsWith(`${RECORD_START}\n`)) throw new Error(`Invalid memory record: ${filepath}`);
   const end = raw.indexOf(`\n${RECORD_END}\n`);
   if (end < 0) throw new Error(`Invalid memory metadata: ${filepath}`);
 
-  const metadata = JSON.parse(raw.slice(RECORD_START.length + 1, end)) as Omit<MemoryRecord, "content">;
+  const metadataRaw = raw.slice(RECORD_START.length + 1, end);
+  let metadata: Record<string, unknown>;
+  try {
+    metadata = JSON.parse(metadataRaw) as Record<string, unknown>;
+  } catch {
+    throw new Error(`Invalid memory JSON metadata: ${filepath}`);
+  }
+
+  // Deep validation
+  const schemaVersion = metadata["schemaVersion"];
+  if (typeof schemaVersion !== "number" || schemaVersion < 1) {
+    throw new Error(`Invalid or missing schemaVersion in ${filepath}`);
+  }
+  if (schemaVersion > MEMORY_RECORD_SCHEMA_VERSION) {
+    // Unknown future version — this record cannot be read safely
+    throw new Error(`Unknown future schema version ${schemaVersion} in ${filepath}`);
+  }
+
+  const id = metadata["id"];
+  if (typeof id !== "string" || !/^[a-f0-9]{32}$/.test(id)) {
+    throw new Error(`Invalid record id in ${filepath}`);
+  }
+
+  const category = metadata["category"];
+  if (typeof category !== "string" || !isMemoryCategory(category)) {
+    throw new Error(`Invalid or missing memory category in ${filepath}`);
+  }
+
+  const scope = metadata["scope"];
+  if (scope !== "global" && scope !== "project") {
+    throw new Error(`Invalid memory scope in ${filepath}`);
+  }
+
+  const projectId = metadata["projectId"];
+  if (typeof projectId !== "string" || !projectId.trim()) {
+    throw new Error(`Invalid or missing projectId in ${filepath}`);
+  }
+
+  const createdAt = metadata["createdAt"];
+  if (typeof createdAt !== "string" || !createdAt) {
+    throw new Error(`Invalid or missing createdAt in ${filepath}`);
+  }
+
+  const updatedAt = metadata["updatedAt"];
+  if (typeof updatedAt !== "string" || !updatedAt) {
+    throw new Error(`Invalid or missing updatedAt in ${filepath}`);
+  }
+
+  const provenanceRaw = metadata["provenance"];
+  if (!provenanceRaw || typeof provenanceRaw !== "object") {
+    throw new Error(`Invalid or missing provenance in ${filepath}`);
+  }
+
   const body = raw.slice(end + `\n${RECORD_END}\n\n`.length);
   const titleEnd = body.indexOf("\n\n");
   if (!body.startsWith("# ") || titleEnd < 0) throw new Error(`Invalid memory body: ${filepath}`);
 
+  const title = body.slice(2, titleEnd).trim();
+  const content = body.slice(titleEnd + 2).trim();
+  if (!title || !content) throw new Error(`Empty title or content in ${filepath}`);
+
+  // V1 compatibility: fill missing fields
+  if (schemaVersion === 1) {
+    const v1Record = metadata as unknown as MemoryRecordV1;
+    // Upgrade to V2: add evidence, scopeDecision, revision fields
+    const provenance = {
+      ...v1Record.provenance,
+      evidence: [] as [],
+      scopeDecision: undefined,
+      revision: undefined,
+    };
+    return {
+      schemaVersion: MEMORY_RECORD_SCHEMA_VERSION as 2,
+      id,
+      category: category as any,
+      scope: scope as any,
+      projectId,
+      title,
+      content,
+      createdAt,
+      updatedAt,
+      provenance,
+    };
+  }
+
+  // V2+ record — return as-is
   return {
-    ...metadata,
-    title: body.slice(2, titleEnd).trim(),
-    content: body.slice(titleEnd + 2).trim(),
+    ...(metadata as Omit<MemoryRecord, "content" | "title">),
+    schemaVersion: MEMORY_RECORD_SCHEMA_VERSION as 2,
+    title,
+    content,
   };
 }
 
@@ -157,30 +263,62 @@ export class FilesystemMemoryRepository {
   }
 
   async save(input: SaveMemoryInput): Promise<MemoryRecord> {
-    const title = normalizeTitle(input.title);
-    const content = input.content.trim();
-    if (!isMemoryCategory(input.category)) throw new Error(`Invalid memory category: ${input.category}`);
-    if (input.scope !== "global" && input.scope !== "project") {
-      throw new Error(`Invalid memory scope: ${input.scope}`);
+    // Validate via shared validator
+    const validated = validateMemoryWrite(
+      { category: input.category, title: input.title, content: input.content, scope: input.scope },
+      { source: "manual" },
+    );
+    if ("kind" in validated) {
+      throw new Error(describeRejection(validated));
     }
-    if (!title) throw new Error("Memory title must not be empty");
-    if (!content) throw new Error("Memory content must not be empty");
+
+    // Manual secret/size guard before any disk I/O
+    if (containsSecret(validated.title) || containsSecret(validated.content)) {
+      throw new Error("Content contains potential secrets; rejected");
+    }
 
     const project = resolveProjectIdentity(input.cwd);
     const projectId = input.scope === "global" ? "global" : project.id;
-    const id = recordId(input.scope, projectId, input.category, title);
+    const title = validated.title;
+    const content = validated.content;
+    const id = recordId(input.scope, projectId, validated.category as any, title);
 
     return this.withWriteLock(async () => {
       if (input.scope === "project" && await exists(this.archivedProjectPath(project.id))) {
         throw new Error("Project memory is archived; restore it before saving");
       }
-      const filepath = this.recordPath(input.scope, project.id, input.category, id);
+      const filepath = this.recordPath(input.scope, project.id, validated.category as any, id);
       const previous = await this.readFileIfPresent(filepath);
       const timestamp = this.now().toISOString();
+
+      // If updating an existing record, create an immutable revision snapshot first
+      if (previous) {
+        const revision: MemoryRevision = {
+          schemaVersion: 2,
+          revisionId: randomUUID(),
+          recordId: id,
+          title: previous.title,
+          content: previous.content,
+          provenance: previous.provenance,
+          createdAt: previous.createdAt,
+          capturedAt: timestamp,
+        };
+        const revisionDir = path.join(
+          this.basePath(input.scope, project.id),
+          "revisions",
+          id,
+        );
+        await fs.mkdir(revisionDir, { recursive: true, mode: 0o700 });
+        await this.atomicWrite(
+          path.join(revisionDir, `${revision.revisionId}.md`),
+          `${JSON.stringify(revision, null, 2)}\n`,
+        );
+      }
+
       const record: MemoryRecord = {
-        schemaVersion: MEMORY_SCHEMA_VERSION,
+        schemaVersion: MEMORY_RECORD_SCHEMA_VERSION,
         id,
-        category: input.category,
+        category: validated.category as any,
         scope: input.scope,
         projectId,
         title,
@@ -189,6 +327,17 @@ export class FilesystemMemoryRepository {
         updatedAt: timestamp,
         provenance: input.provenance || { source: "manual" },
       };
+
+      // Wire revision pointer into the new record's provenance
+      if (previous) {
+        record.provenance = {
+          ...record.provenance,
+          revision: {
+            revisionId: randomUUID(),
+            previousRevisionId: previous.provenance?.revision?.revisionId,
+          },
+        };
+      }
 
       await this.atomicWrite(filepath, serializeRecord(record));
       if (input.scope === "project") {
@@ -251,24 +400,55 @@ export class FilesystemMemoryRepository {
     const project = resolveProjectIdentity(cwd);
     if (!(await exists(this.root))) {
       return {
-        root: this.root, schemaVersion: MEMORY_SCHEMA_VERSION, project,
+        root: this.root, schemaVersion: MEMORY_RECORD_SCHEMA_VERSION, project,
         lifecycle: "new", inactivityDays: 0, longTermCount: 0,
         hasScratchpad: false, hasRecentDaily: false,
         extractionManifestCount: 0, workingManifestCount: 0, permissions: "missing",
+        extractionRunning: false, extractionPending: false,
+        consecutiveExtractionFailures: 0, corruptRecordCount: 0, rollbackFailureCount: 0,
       };
     }
+
+    // Archive consistency: check archive position before and after
+    const archivedBefore = await exists(this.archivedProjectPath(project.id));
     const activeBase = this.basePath("project", project.id);
     const archivedBase = this.archivedProjectPath(project.id);
-    const archived = await exists(archivedBase);
+    const archived = archivedBefore;
     const base = archived ? archivedBase : activeBase;
-    const metadata = await this.readMetadata(base);
+
+    const [metadata, recordsResult] = await Promise.all([
+      this.readMetadata(base),
+      this.listBaseWithDiagnostics(base),
+    ]);
+
+    // Re-check archive position
+    const archivedAfter = await exists(this.archivedProjectPath(project.id));
+    if (archivedBefore !== archivedAfter) {
+      // Archive position changed — retry once
+      const retryBase = archivedAfter ? archivedBase : activeBase;
+      const [retryMeta, retryRecords] = await Promise.all([
+        this.readMetadata(retryBase),
+        this.listBaseWithDiagnostics(retryBase),
+      ]);
+      return this.buildDiagnostics(project, retryMeta ?? undefined, retryRecords, retryBase, archivedAfter);
+    }
+
+    return this.buildDiagnostics(project, metadata ?? undefined, recordsResult, base, archived);
+  }
+
+  private async buildDiagnostics(
+    project: ProjectIdentity,
+    metadata: ProjectMemoryMetadata | undefined,
+    recordsResult: { records: MemoryRecord[]; corruptRecordCount: number },
+    base: string,
+    archived: boolean,
+  ): Promise<MemoryDiagnostics> {
     const inactivityMs = metadata ? this.inactivityMs(metadata.lastActiveAt) : 0;
     const lifecycle: ProjectLifecycleState = archived
       ? "archived"
       : !metadata ? "new"
       : inactivityMs > 90 * DAY_MS ? "archive-due"
       : inactivityMs > 30 * DAY_MS ? "cold" : "hot";
-    const records = await this.listBase(base);
     const latest = path.join(base, "working", "latest.json");
     const dailyDir = path.join(base, "daily");
     const countJson = async (dir: string): Promise<number> => {
@@ -281,16 +461,21 @@ export class FilesystemMemoryRepository {
     }
     return {
       root: this.root,
-      schemaVersion: MEMORY_SCHEMA_VERSION,
+      schemaVersion: MEMORY_RECORD_SCHEMA_VERSION,
       project,
       lifecycle,
       inactivityDays: Math.floor(inactivityMs / DAY_MS),
-      longTermCount: records.length,
+      longTermCount: recordsResult.records.length,
       hasScratchpad: await exists(latest),
       hasRecentDaily,
       extractionManifestCount: await countJson(path.join(this.root, "extractions", project.id)),
       workingManifestCount: await countJson(path.join(this.root, "working-manifests", project.id)),
       permissions: (await fs.stat(this.root)).mode.toString(8).slice(-3),
+      extractionRunning: false,
+      extractionPending: false,
+      consecutiveExtractionFailures: 0,
+      corruptRecordCount: recordsResult.corruptRecordCount,
+      rollbackFailureCount: 0,
     };
   }
 
@@ -311,20 +496,33 @@ export class FilesystemMemoryRepository {
   async loadWorkingState(cwd: string, includeProject = true): Promise<WorkingStateView> {
     const project = resolveProjectIdentity(cwd);
     if (!includeProject) return { scratchpad: "", recentDaily: "", project };
+    // Archive consistency
+    const archivedBefore = await exists(this.archivedProjectPath(project.id));
     const base = this.basePath("project", project.id);
     const latestPath = path.join(base, "working", "latest.json");
     const dailyDir = path.join(base, "daily");
     let scratchpad = "";
     if (await exists(latestPath)) {
       try {
-        const latest = JSON.parse(await fs.readFile(latestPath, "utf8")) as { update?: WorkingStateUpdate };
-        if (latest.update) scratchpad = renderScratchpad(latest.update);
+        const raw = JSON.parse(await fs.readFile(latestPath, "utf8"));
+        try {
+          const parsed = parseWorkingLatest(raw);
+          if (parsed.update) scratchpad = renderScratchpad(parsed.update);
+        } catch {
+          // Fall back to relaxed parsing for backward compat
+          const latest = raw as { update?: WorkingStateUpdate };
+          if (latest.update) scratchpad = renderScratchpad(latest.update);
+        }
       } catch {}
     }
     let recentDaily = "";
     if (await exists(dailyDir)) {
       const files = (await fs.readdir(dailyDir)).filter((file) => /^\d{4}-\d{2}-\d{2}\.md$/.test(file)).sort().reverse();
       if (files[0]) recentDaily = await fs.readFile(path.join(dailyDir, files[0]), "utf8");
+    }
+    if (archivedBefore !== await exists(this.archivedProjectPath(project.id))) {
+      // Retry once
+      return this.loadWorkingState(cwd, includeProject);
     }
     return {
       scratchpad: scratchpad.slice(0, SCRATCHPAD_MAX_CHARS),
@@ -377,7 +575,8 @@ export class FilesystemMemoryRepository {
         throw new Error("Project memory is archived; restore it before extraction");
       }
 
-      const staged: { filepath: string; record: MemoryRecord; content: string }[] = [];
+      const staged: { filepath: string; record: MemoryRecord; revisionContent?: string }[] = [];
+      const revisionContentMap = new Map<string, string | undefined>();
       const stagedPaths = new Set<string>();
       const timestamp = this.now().toISOString();
       for (const input of entries) {
@@ -402,8 +601,31 @@ export class FilesystemMemoryRepository {
         if (stagedPaths.has(filepath)) throw new Error("Extraction batch targets the same record more than once");
         stagedPaths.add(filepath);
         const previous = await this.readFileIfPresent(filepath);
+
+        // If replacing an existing record, capture an immutable revision snapshot
+        if (previous) {
+          const revision: MemoryRevision = {
+            schemaVersion: 2,
+            revisionId: randomUUID(),
+            recordId: id,
+            title: previous.title,
+            content: previous.content,
+            provenance: previous.provenance,
+            createdAt: previous.createdAt,
+            capturedAt: timestamp,
+          };
+          const revisionDir = path.join(
+            this.basePath(input.scope, project.id),
+            "revisions",
+            id,
+          );
+          const revisionFilepath = path.join(revisionDir, `${revision.revisionId}.md`);
+          revisionContentMap.set(revisionFilepath, undefined); // new file, no previous content
+          staged.push({ filepath: revisionFilepath, record: null as any, revisionContent: `${JSON.stringify(revision, null, 2)}\n` });
+        }
+
         const record: MemoryRecord = {
-          schemaVersion: MEMORY_SCHEMA_VERSION,
+          schemaVersion: MEMORY_RECORD_SCHEMA_VERSION,
           id,
           category: input.category,
           scope: input.scope,
@@ -412,70 +634,153 @@ export class FilesystemMemoryRepository {
           content,
           createdAt: previous?.createdAt || timestamp,
           updatedAt: timestamp,
-          provenance: { ...input.provenance, source: "extraction", sourceHash },
+          provenance: {
+            ...input.provenance,
+            source: "extraction",
+            sourceHash,
+            revision: previous?.provenance?.revision
+              ? {
+                  revisionId: randomUUID(),
+                  previousRevisionId: previous.provenance.revision.revisionId,
+                }
+              : undefined,
+          },
         };
-        staged.push({ filepath, record, content: serializeRecord(record) });
+        staged.push({ filepath, record, revisionContent: undefined });
       }
       if (signal?.aborted) throw new Error("Memory extraction aborted");
+
+      // ── Backup all files before writing ──
       const backups = new Map<string, string | undefined>();
+      const writeOrder: { target: string; content: string | undefined }[] = [];
+
+      // 1. Revisions (written first so they exist even if the head write fails)
+      for (const item of staged) {
+        if (item.revisionContent !== undefined) {
+          writeOrder.push({ target: item.filepath, content: item.revisionContent });
+        }
+      }
+
+      // 2. Head records (entries)
+      const entryItems = staged.filter((s) => s.revisionContent === undefined);
+      for (const item of entryItems) {
+        writeOrder.push({ target: item.filepath, content: serializeRecord(item.record) });
+      }
+
+      // 3. Reinforcement
+      const reinforcementFile = this.reinforcementPath(project.id);
+      let reinforcementContent: string | undefined;
+      const previousReinforcement = await exists(reinforcementFile)
+        ? await fs.readFile(reinforcementFile, "utf8")
+        : undefined;
+      const currentReinforcement = previousReinforcement
+        ? JSON.parse(previousReinforcement) as Record<string, ReinforcementState>
+        : {};
+      const nextReinforcement = { ...currentReinforcement };
+      for (const [key, increment] of Object.entries(reinforcementUpdates)) {
+        nextReinforcement[key] = {
+          count: (nextReinforcement[key]?.count || 0) + increment,
+          updatedAt: timestamp,
+        };
+      }
+      reinforcementContent = `${JSON.stringify(nextReinforcement, null, 2)}\n`;
+      writeOrder.push({ target: reinforcementFile, content: reinforcementContent });
+
+      // 4. Project metadata (project.json)
+      if (entries.some((entry) => entry.scope === "project")) {
+        const meta = await this.writeActiveMetadataUnlocked(project);
+        // Already written; we'll back it up during the write phase
+      }
+
+      // 5. Manifest (committed LAST as authoritative publish point)
+      const manifestContent = `${JSON.stringify({ sourceHash, projectId: project.id, recordIds: staged.filter((s) => s.revisionContent === undefined).map((item) => item.record.id), committedAt: timestamp }, null, 2)}\n`;
+
+      // Build full backup set
+      for (const w of writeOrder) {
+        backups.set(w.target, await exists(w.target) ? await fs.readFile(w.target, "utf8") : undefined);
+      }
+      // Also back up project.json before writing
+      const hasProjectScope = entries.some((entry) => entry.scope === "project");
+      const projectJson = hasProjectScope
+        ? path.join(this.basePath("project", project.id), "project.json")
+        : undefined;
+      if (projectJson) {
+        backups.set(projectJson, await exists(projectJson) ? await fs.readFile(projectJson, "utf8") : undefined);
+      }
+      backups.set(manifestFile, await exists(manifestFile) ? await fs.readFile(manifestFile, "utf8") : undefined);
+
+      // ── Write in order ──
       try {
-        for (const item of staged) {
-          backups.set(item.filepath, await exists(item.filepath) ? await fs.readFile(item.filepath, "utf8") : undefined);
+        for (const w of writeOrder) {
           if (signal?.aborted) throw new Error("Memory extraction aborted");
-          await this.atomicWrite(item.filepath, item.content);
+          if (w.content !== undefined) {
+            await this.atomicWrite(w.target, w.content);
+          }
         }
         if (signal?.aborted) throw new Error("Memory extraction aborted");
-        const reinforcementFile = this.reinforcementPath(project.id);
-        const previousReinforcement = await exists(reinforcementFile)
-          ? await fs.readFile(reinforcementFile, "utf8")
-          : undefined;
-        backups.set(reinforcementFile, previousReinforcement);
-        const currentReinforcement = previousReinforcement
-          ? JSON.parse(previousReinforcement) as Record<string, ReinforcementState>
-          : {};
-        const nextReinforcement = { ...currentReinforcement };
-        for (const [key, increment] of Object.entries(reinforcementUpdates)) {
-          nextReinforcement[key] = {
-            count: (nextReinforcement[key]?.count || 0) + increment,
-            updatedAt: timestamp,
-          };
+        // Write project metadata
+        if (entries.some((entry) => entry.scope === "project")) {
+          await this.writeActiveMetadataUnlocked(project);
         }
-        await this.atomicWrite(
-          reinforcementFile,
-          `${JSON.stringify(nextReinforcement, null, 2)}\n`,
-        );
-        backups.set(manifestFile, await exists(manifestFile) ? await fs.readFile(manifestFile, "utf8") : undefined);
-        await this.atomicWrite(
-          manifestFile,
-          `${JSON.stringify({ sourceHash, projectId: project.id, recordIds: staged.map((item) => item.record.id), committedAt: timestamp }, null, 2)}\n`,
-        );
+        // Write manifest LAST
+        await this.atomicWrite(manifestFile, manifestContent);
       } catch (error) {
-        for (const [filepath, previous] of backups) {
-          if (previous === undefined) await fs.rm(filepath, { force: true });
-          else await this.atomicWrite(filepath, previous);
+        // Rollback in REVERSE order, collecting errors
+        const rollbackErrors: Error[] = [];
+        const reverseOrder = [...writeOrder].reverse();
+        for (const w of reverseOrder) {
+          const previous = backups.get(w.target);
+          try {
+            if (previous === undefined) await fs.rm(w.target, { force: true });
+            else await this.atomicWrite(w.target, previous);
+          } catch (e) {
+            rollbackErrors.push(e instanceof Error ? e : new Error(String(e)));
+          }
         }
-        throw error;
-      }
-      try {
-        if (entries.some((entry) => entry.scope === "project")) await this.writeActiveMetadataUnlocked(project);
-      } catch (error) {
-        for (const [filepath, previous] of backups) {
-          if (previous === undefined) await fs.rm(filepath, { force: true });
-          else await this.atomicWrite(filepath, previous);
+        // Roll back project.json if it was part of the batch
+        if (projectJson) {
+          const prevMeta = backups.get(projectJson);
+          if (prevMeta !== undefined) {
+            try {
+              await this.atomicWrite(projectJson, prevMeta);
+            } catch (e) {
+              rollbackErrors.push(e instanceof Error ? e : new Error(String(e)));
+            }
+          }
+        }
+        // Roll back manifest
+        const prevManifest = backups.get(manifestFile);
+        if (prevManifest !== undefined) {
+          try {
+            await this.atomicWrite(manifestFile, prevManifest);
+          } catch (e) {
+            rollbackErrors.push(e instanceof Error ? e : new Error(String(e)));
+          }
+        }
+        // Attach rollback errors to the original error
+        if (rollbackErrors.length > 0) {
+          (error as any).rollbackErrors = rollbackErrors;
         }
         throw error;
       }
       for (const scope of new Set(entries.map((entry) => entry.scope))) {
         try { await this.rebuildIndexUnlocked(scope, project); } catch {}
       }
-      return staged.map((item) => item.record);
+      return staged.filter((s) => s.revisionContent === undefined).map((item) => item.record);
     });
   }
 
   async list(cwd: string, options: boolean | ListMemoryOptions = {}): Promise<MemoryRecord[]> {
     const project = resolveProjectIdentity(cwd);
     const normalized = typeof options === "boolean" ? { includeArchived: options } : options;
-    return this.listUnlocked(project, normalized);
+    // Archive consistency: check before and after
+    const archivedBefore = await exists(this.archivedProjectPath(project.id));
+    const result = await this.listUnlocked(project, normalized);
+    if (archivedBefore !== await exists(this.archivedProjectPath(project.id))) {
+      // Archive position changed — retry once
+      return this.listUnlocked(project, normalized);
+    }
+    return result;
   }
 
   async search(
@@ -489,17 +794,37 @@ export class FilesystemMemoryRepository {
     const normalized = typeof options === "number" ? { max: options } : options;
     const project = resolveProjectIdentity(cwd);
     const archivedBase = this.archivedProjectPath(project.id);
-    const archivedVisible = normalized.includeArchived === true && await exists(archivedBase);
-    const [globalAndProject, archivedRecords] = await Promise.all([
+    const archivedBefore = await exists(archivedBase);
+    const archivedVisible = normalized.includeArchived === true && archivedBefore;
+    const records = await Promise.all([
       this.listUnlocked(project, { includeProject: normalized.includeProject }),
       archivedVisible ? this.listBase(archivedBase) : Promise.resolve([]),
     ]);
-    const records = [...globalAndProject, ...archivedRecords]
-      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-    const archivedRecordIds = new Set(archivedRecords.map((record) => record.id));
-    return records
+    const globalAndProject = records[0];
+    const archivedRecords = records[1];
+    const allRecords = [...globalAndProject, ...archivedRecords];
+    // Archive consistency: retry if position changed during read
+    if (archivedBefore !== await exists(archivedBase)) {
+      const retryArchivedVisible = normalized.includeArchived === true && await exists(archivedBase);
+      const [retryGlobal, retryArchived] = await Promise.all([
+        this.listUnlocked(project, { includeProject: normalized.includeProject }),
+        retryArchivedVisible ? this.listBase(archivedBase) : Promise.resolve([]),
+      ]);
+      return this.formatSearchResults(query, [...retryGlobal, ...retryArchived], normalized.max, new Set(retryArchived.map((r) => r.id)));
+    }
+    return this.formatSearchResults(query, allRecords, normalized.max, new Set(archivedRecords.map((r) => r.id)));
+  }
+
+  private formatSearchResults(
+    query: string,
+    records: MemoryRecord[],
+    max: number | undefined,
+    archivedRecordIds: Set<string>,
+  ): MemorySearchResult[] {
+    const sorted = records.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    return sorted
       .filter((record) => `${record.title}\n${record.content}`.toLocaleLowerCase().includes(query))
-      .slice(0, Math.max(0, normalized.max ?? 10))
+      .slice(0, Math.max(0, max ?? 10))
       .map((record) => {
         const text = `${record.title}\n${record.content}`;
         const index = text.toLocaleLowerCase().indexOf(query);
@@ -518,9 +843,26 @@ export class FilesystemMemoryRepository {
     limits: { maxEntries?: number; maxChars?: number; includeProject?: boolean } = {},
   ): Promise<MemoryPrompt> {
     const project = resolveProjectIdentity(cwd);
+    // Archive consistency
+    const archivedBefore = await exists(this.archivedProjectPath(project.id));
     const records = await this.listUnlocked(project, {
       includeProject: limits.includeProject,
     });
+    if (archivedBefore !== await exists(this.archivedProjectPath(project.id))) {
+      // Retry once
+      const retryRecords = await this.listUnlocked(project, {
+        includeProject: limits.includeProject,
+      });
+      return this.buildPromptFromRecords(retryRecords, project, limits);
+    }
+    return this.buildPromptFromRecords(records, project, limits);
+  }
+
+  private buildPromptFromRecords(
+    records: MemoryRecord[],
+    project: ProjectIdentity,
+    limits: { maxEntries?: number; maxChars?: number },
+  ): MemoryPrompt {
     if (records.length === 0) return { prompt: "", count: 0, project };
 
     const maxEntries = limits.maxEntries ?? DEFAULT_PROMPT_ENTRY_LIMIT;
@@ -546,25 +888,44 @@ export class FilesystemMemoryRepository {
 
   async getProjectLifecycle(cwd: string): Promise<ProjectLifecycle> {
     const project = resolveProjectIdentity(cwd);
+    // Archive consistency
+    const archivedBefore = await exists(this.archivedProjectPath(project.id));
     const archived = await this.readMetadata(this.archivedProjectPath(project.id));
     if (archived) {
+      if (archivedBefore !== await exists(this.archivedProjectPath(project.id))) {
+        // Retry once
+        const retryArchived = await this.readMetadata(this.archivedProjectPath(project.id));
+        if (retryArchived) {
+          return { state: "archived", inactivityDays: this.inactivityDays(retryArchived.lastActiveAt), project, metadata: retryArchived };
+        }
+      }
       return { state: "archived", inactivityDays: this.inactivityDays(archived.lastActiveAt), project, metadata: archived };
     }
 
     const metadata = await this.readMetadata(this.basePath("project", project.id));
+    if (archivedBefore !== await exists(this.archivedProjectPath(project.id))) {
+      // Retry once
+      const retryMeta = await this.readMetadata(this.basePath("project", project.id));
+      if (!retryMeta) return { state: "new", inactivityDays: 0, project };
+      return this.buildLifecycleFromMetadata(retryMeta);
+    }
     if (!metadata) return { state: "new", inactivityDays: 0, project };
+    return this.buildLifecycleFromMetadata(metadata);
+  }
+
+  private buildLifecycleFromMetadata(metadata: ProjectMemoryMetadata): ProjectLifecycle {
     const inactivityMs = this.inactivityMs(metadata.lastActiveAt);
     if (metadata.status === "archived") {
       return {
         state: "archive-due",
         inactivityDays: Math.floor(inactivityMs / DAY_MS),
-        project,
+        project: { id: metadata.projectId, cwd: metadata.cwd, displayName: metadata.displayName, aliased: false },
         metadata,
       };
     }
     const inactivityDays = Math.floor(inactivityMs / DAY_MS);
     const state = inactivityMs > 90 * DAY_MS ? "archive-due" : inactivityMs > 30 * DAY_MS ? "cold" : "hot";
-    return { state, inactivityDays, project, metadata };
+    return { state, inactivityDays, project: { id: metadata.projectId, cwd: metadata.cwd, displayName: metadata.displayName, aliased: false }, metadata };
   }
 
   async markProjectActive(cwd: string): Promise<ProjectMemoryMetadata> {
@@ -575,7 +936,7 @@ export class FilesystemMemoryRepository {
       if (await exists(archivedPath)) throw new Error("Project memory is archived; restore it before activation");
       const previous = await this.readMetadata(activePath);
       const metadata: ProjectMemoryMetadata = {
-        schemaVersion: MEMORY_SCHEMA_VERSION,
+        schemaVersion: MEMORY_RECORD_SCHEMA_VERSION,
         projectId: project.id,
         displayName: project.displayName,
         cwd: project.cwd,
@@ -603,7 +964,7 @@ export class FilesystemMemoryRepository {
       const previous = await this.readMetadata(source);
       const timestamp = this.now().toISOString();
       const metadata: ProjectMemoryMetadata = {
-        schemaVersion: MEMORY_SCHEMA_VERSION,
+        schemaVersion: MEMORY_RECORD_SCHEMA_VERSION,
         projectId: project.id,
         displayName: project.displayName,
         cwd: project.cwd,
@@ -628,7 +989,7 @@ export class FilesystemMemoryRepository {
 
       const previous = await this.readMetadata(source);
       const metadata: ProjectMemoryMetadata = {
-        schemaVersion: MEMORY_SCHEMA_VERSION,
+        schemaVersion: MEMORY_RECORD_SCHEMA_VERSION,
         projectId: project.id,
         displayName: project.displayName,
         cwd: project.cwd,
@@ -660,6 +1021,49 @@ export class FilesystemMemoryRepository {
   async rebuildIndex(scope: MemoryScope, cwd: string): Promise<void> {
     const project = resolveProjectIdentity(cwd);
     await this.withWriteLock(() => this.rebuildIndexUnlocked(scope, project));
+  }
+
+  /** List all revision snapshots for a given record. */
+  async listRevisions(recordId: string, cwd: string): Promise<MemoryRevision[]> {
+    if (!/^[a-f0-9]{32}$/.test(recordId)) return [];
+    const project = resolveProjectIdentity(cwd);
+    const base = this.basePath("project", project.id);
+    const revisionDir = path.join(base, "revisions", recordId);
+    if (!(await exists(revisionDir))) return [];
+
+    const revisions: MemoryRevision[] = [];
+    for (const entry of await fs.readdir(revisionDir, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith(".md")) continue;
+      try {
+        const raw = await fs.readFile(path.join(revisionDir, entry.name), "utf8");
+        const rev = JSON.parse(raw) as MemoryRevision;
+        if (rev.schemaVersion === 2 && rev.recordId === recordId) {
+          revisions.push(rev);
+        }
+      } catch {
+        // Corrupt revision — skip
+      }
+    }
+    return revisions.sort((a, b) => a.capturedAt.localeCompare(b.capturedAt));
+  }
+
+  /** Get a specific revision snapshot by ID. */
+  async getRevision(recordId: string, revisionId: string, cwd: string): Promise<MemoryRevision | undefined> {
+    if (!/^[a-f0-9]{32}$/.test(recordId) || !revisionId) return undefined;
+    const project = resolveProjectIdentity(cwd);
+    const revisionDir = path.join(this.basePath("project", project.id), "revisions", recordId);
+    const filepath = path.join(revisionDir, `${revisionId}.md`);
+    if (!(await exists(filepath))) return undefined;
+    try {
+      const raw = await fs.readFile(filepath, "utf8");
+      const rev = JSON.parse(raw) as MemoryRevision;
+      if (rev.schemaVersion === 2 && rev.recordId === recordId && rev.revisionId === revisionId) {
+        return rev;
+      }
+    } catch {
+      // Corrupt revision
+    }
+    return undefined;
   }
 
   private basePath(scope: MemoryScope, projectId: string): string {
@@ -712,7 +1116,7 @@ export class FilesystemMemoryRepository {
     if (!(await exists(filepath))) return undefined;
     try {
       const metadata = JSON.parse(await fs.readFile(filepath, "utf8")) as ProjectMemoryMetadata;
-      if (metadata.schemaVersion !== MEMORY_SCHEMA_VERSION || !metadata.projectId || !metadata.lastActiveAt) {
+      if (metadata.schemaVersion !== MEMORY_RECORD_SCHEMA_VERSION || !metadata.projectId || !metadata.lastActiveAt) {
         return undefined;
       }
       return metadata;
@@ -725,7 +1129,7 @@ export class FilesystemMemoryRepository {
     const base = this.basePath("project", project.id);
     const previous = await this.readMetadata(base);
     const metadata: ProjectMemoryMetadata = {
-      schemaVersion: MEMORY_SCHEMA_VERSION,
+      schemaVersion: MEMORY_RECORD_SCHEMA_VERSION,
       projectId: project.id,
       displayName: project.displayName,
       cwd: project.cwd,
@@ -761,6 +1165,29 @@ export class FilesystemMemoryRepository {
       }
     }
     return records;
+  }
+
+  /** Like listBase but also returns corrupt record count for diagnostics. */
+  private async listBaseWithDiagnostics(base: string): Promise<{ records: MemoryRecord[]; corruptRecordCount: number }> {
+    const entriesDir = path.join(base, "entries");
+    if (!(await exists(entriesDir))) return { records: [], corruptRecordCount: 0 };
+
+    const records: MemoryRecord[] = [];
+    let corruptRecordCount = 0;
+    for (const category of await fs.readdir(entriesDir, { withFileTypes: true })) {
+      if (!category.isDirectory()) continue;
+      const categoryDir = path.join(entriesDir, category.name);
+      for (const entry of await fs.readdir(categoryDir, { withFileTypes: true })) {
+        if (!entry.isFile() || !entry.name.endsWith(".md")) continue;
+        const filepath = path.join(categoryDir, entry.name);
+        try {
+          records.push(parseRecord(await fs.readFile(filepath, "utf8"), filepath));
+        } catch {
+          corruptRecordCount += 1;
+        }
+      }
+    }
+    return { records, corruptRecordCount };
   }
 
   private async readFileIfPresent(filepath: string): Promise<MemoryRecord | undefined> {

@@ -1,6 +1,0 @@
-{"type":"message","message":{"role":"user","content":[{"type":"text","text":"我之前已经读过 agent-loop.ts 的源码了，对 Pi 的双层循环和 EventStream 比较清楚。"}]},"timestamp":"2026-07-24T11:00:00Z"}
-{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"好的，那我就不用从头解释 Agent Loop 了。直接讨论具体问题。"}]},"timestamp":"2026-07-24T11:00:05Z"}
-{"type":"message","message":{"role":"user","content":[{"type":"text","text":"对。不过我对 Docker 还不太熟，如果涉及到容器化的部分，你得详细解释一下。"}]},"timestamp":"2026-07-24T11:01:00Z"}
-{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"明白了。Docker 相关的问题我会从基础讲起。你是想用 Docker 部署什么服务？"}]},"timestamp":"2026-07-24T11:01:05Z"}
-{"type":"message","message":{"role":"user","content":[{"type":"text","text":"先不急。对了，TypeScript 的类型体操我比较熟悉了，不用解释泛型那些基础。但关于 Rust 我完全没接触过。"}]},"timestamp":"2026-07-24T11:02:00Z"}
-{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"清楚了。TS 你熟，Docker 和 Rust 需要从基础来。"}]},"timestamp":"2026-07-24T11:02:05Z"}

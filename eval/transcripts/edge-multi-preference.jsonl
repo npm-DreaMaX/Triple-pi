@@ -1,5 +1,0 @@
-{"type":"message","message":{"role":"user","content":[{"type":"text","text":"今天说一下我的编码规范。第一，TypeScript 必须用 strict 模式，任何项目都不能关掉 strict。"}]},"timestamp":"2026-07-24T18:00:00Z"}
-{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"明白了，strict 模式必须开启。还有别的吗？"}]},"timestamp":"2026-07-24T18:00:05Z"}
-{"type":"message","message":{"role":"user","content":[{"type":"text","text":"第二，绝对禁止使用 any 类型。任何地方出现 any 都算代码质量问题。第三，所有公开的函数都要写单元测试，不能跳过。"}]},"timestamp":"2026-07-24T18:01:00Z"}
-{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"记下了。禁用 any，所有公开函数写单测。这是三条偏好/规则。"}]},"timestamp":"2026-07-24T18:01:05Z"}
-{"type":"message","message":{"role":"user","content":[{"type":"text","text":"对。现在帮我写个 util 函数，就用这些规则。"}]},"timestamp":"2026-07-24T18:02:00Z"}

@@ -27,6 +27,7 @@ function trace(overrides: Partial<ExtractionTrace>): ExtractionTrace {
     extractionOutputTokens: 200,
     reviewInputTokens: 800,
     reviewOutputTokens: 150,
+    extractionStatus: "ok",
     status: "success",
     timestamp: new Date().toISOString(),
     extractorVersion: 1,
@@ -35,9 +36,14 @@ function trace(overrides: Partial<ExtractionTrace>): ExtractionTrace {
 }
 
 describe("ExtractionTrace", () => {
-  it("generates unique trace IDs", () => {
+  it("generates unique trace IDs using crypto.randomUUID", () => {
     const ids = new Set(Array.from({ length: 100 }, () => generateTraceId()));
     expect(ids.size).toBe(100);
+    // Verify UUID v4 format
+    const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+    for (const id of ids) {
+      expect(id).toMatch(uuidPattern);
+    }
   });
 
   it("summarizes a single success trace", () => {
@@ -76,9 +82,22 @@ describe("ExtractionTrace", () => {
       trace({ traceId: generateTraceId(), totalLatencyMs: i * 10 }),
     );
     const summary = summarizeTraces(traces);
-    // P95 = floor(100 * 0.95) = index 95 → 95 × 10 = 950ms
-    // P99 = floor(100 * 0.99) = index 99 → 99 × 10 = 990ms
     expect(summary.p95LatencyMs).toBe(950);
     expect(summary.p99LatencyMs).toBe(990);
+  });
+
+  it("includes pipeline stage fields in the type", () => {
+    const t = trace({
+      extractionStatus: "failed",
+      providerFailure: "timeout",
+      reviewFailure: "schema error",
+      commitFailure: "disk full",
+      status: "infra-failure",
+    });
+    expect(t.extractionStatus).toBe("failed");
+    expect(t.providerFailure).toBe("timeout");
+    expect(t.reviewFailure).toBe("schema error");
+    expect(t.commitFailure).toBe("disk full");
+    expect(t.status).toBe("infra-failure");
   });
 });

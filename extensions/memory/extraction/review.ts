@@ -12,6 +12,8 @@ Each item must have exactly:
 - content: unchanged candidate content
 - evidence: unchanged exact evidence
 - sourceEntryId: unchanged source entry ID
+- category: unchanged candidate category
+- scope: unchanged candidate scope
 
 Remove temporary progress, repository-discoverable facts, secrets, vague claims, and unsupported memories.
 You may NOT rewrite, merge, or invent content. Grounded rewriting is handled deterministically elsewhere.`;
@@ -23,6 +25,8 @@ export interface ReviewDecision {
   content: string;
   evidence: string;
   sourceEntryId: string;
+  category: string;
+  scope: string;
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -77,14 +81,19 @@ export async function reviewCandidates(input: {
   parsed.forEach((value, index) => {
     if (!isObject(value)) throw new Error("Invalid memory review item");
     const keys = Object.keys(value).sort();
-    const expected = ["action", "content", "evidence", "reason", "sourceEntryId", "title"];
-    if (keys.length !== expected.length || keys.some((key, position) => key !== expected[position])) throw new Error("Invalid memory review schema");
+    // Accept both old schema (without category/scope) and new schema (with category/scope)
+    const normalized = Object.keys(value).filter((k) => k !== "category" && k !== "scope").sort();
+    const baseExpected = ["action", "content", "evidence", "reason", "sourceEntryId", "title"];
+    if (normalized.length !== baseExpected.length || normalized.some((key, position) => key !== baseExpected[position])) throw new Error("Invalid memory review schema");
     const candidate = input.candidates[index];
-    const { action, reason, title, content, evidence, sourceEntryId } = value;
+    const { action, reason, title, content, evidence, sourceEntryId, category: reviewCategory, scope: reviewScope } = value as Record<string, unknown>;
     if ((action !== "keep" && action !== "remove") || typeof reason !== "string") throw new Error("Invalid memory review decision");
     if (title !== candidate.title || content !== candidate.content || evidence !== candidate.evidence || sourceEntryId !== candidate.sourceEntryId) {
       throw new Error("Memory review attempted to rewrite grounded candidate");
     }
+    // If reviewer provided category/scope, validate they match the candidate
+    if (reviewCategory !== undefined && reviewCategory !== candidate.category) throw new Error("Memory review attempted to change candidate category");
+    if (reviewScope !== undefined && reviewScope !== candidate.scope) throw new Error("Memory review attempted to change candidate scope");
     if (!userMessages.get(candidate.sourceEntryId)?.includes(candidate.evidence)) throw new Error("Memory review lost grounding");
     if (containsSecret(candidate.title) || containsSecret(candidate.content) || containsSecret(candidate.evidence)) throw new Error("Memory review contains secret");
     if (action === "keep") kept.push(candidate);

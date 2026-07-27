@@ -1,4 +1,8 @@
 import { isMemoryCategory, type MemoryCategory, type MemoryScope } from "../domain.ts";
+import {
+  containsSecret as containsSecretValidation,
+  resolveAutomaticScope,
+} from "../validation.ts";
 import type { ExtractionMessage, ExtractionSource } from "./source.ts";
 
 const MAX_CANDIDATES = 10;
@@ -6,6 +10,8 @@ const MAX_TITLE_LENGTH = 120;
 const MAX_CONTENT_LENGTH = 2_000;
 const MAX_EVIDENCE_LENGTH = 500;
 
+// Keep existing SECRET_PATTERNS for backward compatibility in redactSecrets.
+// New code should import containsSecret / redactSecretsFromText from validation.ts.
 const SECRET_PATTERNS = [
   /\b(?:sk|pk|api|key|token|secret)[-_][a-zA-Z0-9_-]{12,}\b/gi,
   /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g,
@@ -56,10 +62,7 @@ export function redactSecrets(messages: ExtractionMessage[]): PreparedExtraction
 }
 
 export function containsSecret(value: string): boolean {
-  return SECRET_PATTERNS.some((pattern) => {
-    pattern.lastIndex = 0;
-    return pattern.test(value);
-  });
+  return containsSecretValidation(value);
 }
 
 function plainObject(value: unknown): value is Record<string, unknown> {
@@ -101,6 +104,9 @@ export function validateCandidates(raw: string, source: ExtractionSource): Extra
       typeof sourceEntryId !== "string" ||
       (scope !== "project" && scope !== "global")
     ) throw new CandidateValidationError("Extraction candidate failed strict validation");
+    // Apply automatic scope guard — global candidates without explicit
+    // cross-project evidence are deterministically downgraded to project.
+    const validatedScope = resolveAutomaticScope(scope, evidence);
     const sourceMessage = userMessages.get(sourceEntryId);
     if (!sourceMessage || !sourceMessage.content.includes(evidence)) throw new CandidateValidationError("Extraction candidate failed strict validation");
     if (
@@ -117,7 +123,7 @@ export function validateCandidates(raw: string, source: ExtractionSource): Extra
       content: content.trim(),
       evidence,
       sourceEntryId,
-      scope,
+      scope: validatedScope,
     });
   }
   return candidates;

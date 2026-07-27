@@ -1,10 +1,14 @@
 /**
- * Reviewer Comparison — 比较有 Reviewer 和无 Reviewer 的提取质量。
+ * Reviewer Fixture Plumbing — 只验证 fixture/metrics 接线，不证明 LLM Reviewer 效果。
  *
- * 只做 recorded（mock LLM），不调真实模型。
- * 目的是验证 Grounded Review 这一步是否真的提升了 precision。
+ * 这个模块模拟 bad-candidate 注入和 reviewer 的 keep/remove 决策。
+ * 它不调用真实 LLM，只验证:
+ *  - metrics.ts 的 evaluateRecords 能正确计算 TP/FP/FN
+ *  - recorded-cases.ts 的录制数据能通过 pipeline 格式
+ *  - 指标在有/无 review 时变化方向正确
  *
- * 输出一个 comparison report，可以直接用于面试。
+ * !!! 这个文件不证明 LLM Reviewer 在真实场景中有效 !!!
+ * 真实 Reviewer 效果评估请使用 eval/reviewer-pilot.ts。
  */
 
 import { EVAL_CASES, type EvalCase } from "./cases.ts";
@@ -46,15 +50,11 @@ export interface ReviewerComparisonReport {
 
 /**
  * Mock 一些 Reviewer 会拒绝的"坏候选"来模拟 Reviewer 的行为。
- *
- * 在真实 Live Eval 中，这部分由 LLM Reviewer 完成。
- * 这里为了确定性测试，手动注入 Reviewer 会拒绝的候选。
  */
 function simulateBadCandidates(
   testCase: EvalCase,
   goodCandidates: RecordedCandidate[],
 ): RecordedCandidate[] {
-  // 为 noise-only case 注入一些虚假候选，模拟 LLM 过度提取
   if (testCase.id === "noise-only") {
     return [
       {
@@ -72,7 +72,6 @@ function simulateBadCandidates(
     ];
   }
 
-  // 为 mixed-noise case 注入和噪声相关的虚假候选
   if (testCase.id === "mixed-noise") {
     return [
       ...goodCandidates,
@@ -96,10 +95,6 @@ function simulateBadCandidates(
 
 /**
  * 模拟 Reviewer 的 keep/remove 决策。
- *
- * Reviewer 会删除：
- * 1. 包含 forbidden 关键词的候选（噪声）
- * 2. evidence 包含 "temporary" 或 "debug" 的候选
  */
 function simulateReview(candidates: RecordedCandidate[], testCase: EvalCase): RecordedCandidate[] {
   const forbiddenLower = testCase.forbidden.map((f) => f.toLocaleLowerCase());
@@ -115,7 +110,7 @@ function simulateReview(candidates: RecordedCandidate[], testCase: EvalCase): Re
 
 function candidatesToRecords(candidates: RecordedCandidate[], sessionId: string): MemoryRecord[] {
   return candidates.map((c, i) => ({
-    schemaVersion: 1,
+    schemaVersion: 2,
     id: `mock-${i}`,
     category: c.category as MemoryRecord["category"],
     scope: c.scope as MemoryRecord["scope"],
@@ -163,9 +158,9 @@ export function runReviewerComparison(): ReviewerComparisonReport {
       removedByReviewer: allCandidates.length - reviewedCandidates.length,
       withoutReviewer,
       withReviewer,
-      f1Improved: withReviewer.f1 >= withoutReviewer.f1,
-      precisionImproved: withReviewer.precision >= withoutReviewer.precision,
-      recallMaintained: withReviewer.recall >= withoutReviewer.recall - 0.01, // 1% tolerance
+      f1Improved: (withReviewer.f1 ?? 0) >= (withoutReviewer.f1 ?? 0),
+      precisionImproved: (withReviewer.precision ?? 0) >= (withoutReviewer.precision ?? 0),
+      recallMaintained: (withReviewer.recall ?? 1) >= (withoutReviewer.recall ?? 1) - 0.01,
     });
   }
 

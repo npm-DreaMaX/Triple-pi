@@ -1,6 +1,0 @@
-{"type":"message","message":{"role":"user","content":[{"type":"text","text":"这个项目用 TypeScript，测试框架是 vitest。Node 版本要求 20+。"}]},"timestamp":"2026-07-24T13:00:00Z"}
-{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"好的。TypeScript + vitest，Node 20+。需要我做什么？"}]},"timestamp":"2026-07-24T13:00:05Z"}
-{"type":"message","message":{"role":"user","content":[{"type":"text","text":"对了，有个重要的事情——这个项目三个月后要迁移到 Go。因为 Rust 团队那边觉得 Go 更适合他们维护。"}]},"timestamp":"2026-07-24T13:01:00Z"}
-{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"这很重要。迁移到 Go 会影响到所有新功能的选型。我记住了。"}]},"timestamp":"2026-07-24T13:01:05Z"}
-{"type":"message","message":{"role":"user","content":[{"type":"text","text":"前几天装了 pi-intercom、pi-fff 这些扩展，都在 ~/.pi/agent/extensions/ 里了。配置你不用管。"}]},"timestamp":"2026-07-24T13:02:00Z"}
-{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"明白，扩展已经装好了。"}]},"timestamp":"2026-07-24T13:02:05Z"}

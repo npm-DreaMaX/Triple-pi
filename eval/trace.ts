@@ -8,6 +8,8 @@
  *  - 统计 token 成本
  */
 
+import { randomUUID } from "node:crypto";
+
 export interface ExtractionTrace {
   /** UUID v4 */
   traceId: string;
@@ -49,8 +51,14 @@ export interface ExtractionTrace {
   reviewInputTokens?: number;
   reviewOutputTokens?: number;
 
+  /** ── Pipeline 阶段状态 ── */
+  extractionStatus?: "ok" | "skipped" | "failed";
+  providerFailure?: string;
+  reviewFailure?: string;
+  commitFailure?: string;
+
   /** ── 状态 ── */
-  status: "success" | "no-source" | "validation-failed" | "review-failed" | "commit-failed" | "aborted";
+  status: "success" | "no-source" | "validation-failed" | "review-failed" | "commit-failed" | "aborted" | "infra-failure";
   errorMessage?: string;
 
   /** ── 元数据 ── */
@@ -150,10 +158,5 @@ function avg(arr: number[]): number {
  * 生成唯一的 trace ID。
  */
 export function generateTraceId(): string {
-  // 简单的 UUID v4-like ID，零依赖
-  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
-    const r = (Math.random() * 16) | 0;
-    const v = c === "x" ? r : (r & 0x3) | 0x8;
-    return v.toString(16);
-  });
+  return randomUUID();
 }

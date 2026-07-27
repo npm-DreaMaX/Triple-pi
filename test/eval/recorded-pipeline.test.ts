@@ -1,11 +1,14 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
+import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { EVAL_CASES } from "../../eval/cases.ts";
 import { evaluateRecords } from "../../eval/metrics.ts";
 import { recordedOutput } from "../../eval/recorded-cases.ts";
 import { FilesystemMemoryRepository } from "../../extensions/memory/repository.ts";
+
+const pathJoin = path.join;
 
 const provider = vi.hoisted(() => ({ extractCandidateJson: vi.fn() }));
 const reviewer = vi.hoisted(() => ({ reviewCandidates: vi.fn() }));
@@ -40,7 +43,13 @@ describe("recorded current-pipeline eval", () => {
       const records = (await repository.list(testCase.cwd)).filter((r) => r.provenance.sessionId === `session-${testCase.id}`);
       const metrics = evaluateRecords(testCase, records);
       expect(metrics.failures).toEqual([]);
-      expect(metrics.f1).toBe(1);
+      // noise-only case: f1 is null (precision undefined for empty/noise cases)
+      if (testCase.id === "noise-only") {
+        expect(metrics.noiseRejected).toBe(true);
+        expect(metrics.f1).toBeNull();
+      } else {
+        expect(metrics.f1).toBe(1);
+      }
     });
   }
 
@@ -52,7 +61,3 @@ describe("recorded current-pipeline eval", () => {
     expect((await repository.search("B only", "/eval/A"))).toEqual([]);
   });
 });
-
-function pathJoin(...parts: string[]): string {
-  return parts.join("/");
-}

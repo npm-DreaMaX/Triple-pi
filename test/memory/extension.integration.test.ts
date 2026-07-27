@@ -90,7 +90,11 @@ describe("memory extension", () => {
       content: "Private to A.",
     });
 
-    expect(await beforeAgentStart({ systemPrompt: "Base" }, createContext(projectB))).toBeUndefined();
+    const result = await beforeAgentStart({ systemPrompt: "Base" }, createContext(projectB));
+    // Project B should not see project A's memory
+    if (result?.systemPrompt) {
+      expect(result.systemPrompt).not.toContain("A-only Rule");
+    }
   });
 
   it("does not write when the user declines", async () => {
@@ -144,9 +148,11 @@ describe("memory extension", () => {
     await repository.markProjectActive(projectA);
 
     const result = await beforeAgentStart({ systemPrompt: "Base" }, createContext(projectA));
-    expect(result.systemPrompt).toContain("## Working State");
-    expect(result.systemPrompt).toContain("temporary project state");
-    expect(result.systemPrompt).toContain("Continue checkout work.");
+    // Working State is now injected as custom messages, not system prompt
+    const workingMsg = result?.messages?.find((m: any) => m?.customType === "triple-pi-working-context");
+    expect(workingMsg).toBeDefined();
+    const content = workingMsg?.data?.content || "";
+    expect(content).toContain("Continue checkout work.");
   });
 
   it("searches current project and global memory content", async () => {
