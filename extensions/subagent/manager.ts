@@ -34,6 +34,9 @@ import type {
 } from "./types.ts";
 import { parseReviewerOutput } from "./review-core.ts";
 
+/** The complete read-only tool surface available to Reviewer sessions. */
+export const REVIEWER_TOOLS = ["read", "grep", "find", "ls"] as const;
+
 // =============================================================================
 // Types
 // =============================================================================
@@ -89,6 +92,7 @@ export class SubAgentManager {
         noPromptTemplates: true,
         noThemes: true,
         noContextFiles: true,
+        systemPrompt: options.systemPrompt,
       });
       await resourceLoader.reload();
 
@@ -98,7 +102,7 @@ export class SubAgentManager {
         model: options.model,
         resourceLoader,
         sessionManager: SessionManager.inMemory(),
-        tools: ["read", "grep", "find", "ls"],
+        tools: [...REVIEWER_TOOLS],
       });
 
       session = sessionResult.session;
@@ -112,7 +116,11 @@ export class SubAgentManager {
         timer = setTimeout(() => {
           timer = undefined;
           session?.abort().catch(() => {});
-          resolve({ kind: "timeout" });
+          resolve({
+            kind: "timeout",
+            durationMs: Date.now() - t0,
+            toolCalls: session ? toolCallCount(session) : 0,
+          });
         }, options.timeoutMs);
       });
 
@@ -120,11 +128,13 @@ export class SubAgentManager {
       return await Promise.race([reviewPromise, timeoutPromise]);
     } catch (error: any) {
       if (error?.name === "AbortError") {
-        return { kind: "aborted" };
+        return { kind: "aborted", durationMs: Date.now() - t0, toolCalls: session ? toolCallCount(session) : 0 };
       }
       return {
         kind: "session-create-failed",
         error: error instanceof Error ? error.message : String(error),
+        durationMs: Date.now() - t0,
+        toolCalls: session ? toolCallCount(session) : 0,
       };
     } finally {
       if (timer !== undefined) clearTimeout(timer);
@@ -179,8 +189,9 @@ export class SubAgentManager {
         );
       }
 
-      // Success
-      const coverage: ReviewCoverage = options.chunkCount <= 1 ? "complete" : "partial";
+      // One manager invocation fully reviews the one chunk it receives. Overall
+      // multi-chunk coverage is determined by the serial orchestrator.
+      const coverage: ReviewCoverage = "complete";
 
       const subagentResult: SubagentResult = {
         taskId,
@@ -197,14 +208,15 @@ export class SubAgentManager {
       return { kind: "success", result: subagentResult };
     } catch (error: any) {
       // Distinguish aborted vs provider failure
+      const metrics = { durationMs: Date.now() - t0, toolCalls: toolCallCount(session) };
       if (error?.name === "AbortError" || options.signal?.aborted) {
-        return { kind: "aborted" };
+        return { kind: "aborted", ...metrics };
       }
       const msg = error instanceof Error ? error.message : String(error);
       if (msg.toLowerCase().includes("abort") || msg.toLowerCase().includes("signal")) {
-        return { kind: "aborted" };
+        return { kind: "aborted", ...metrics };
       }
-      return { kind: "provider-failed", error: msg };
+      return { kind: "provider-failed", error: msg, ...metrics };
     } finally {
       removeSignalHandler?.();
     }
@@ -232,13 +244,14 @@ export class SubAgentManager {
     error: string,
     raw: string,
   ): ReviewResultUnion {
+    const metrics = { durationMs: Date.now() - t0, toolCalls: tCalls };
     if (failureKind === "parse-failed") {
-      return { kind: "parse-failed", error, raw };
+      return { kind: "parse-failed", error, raw, ...metrics };
     }
     if (failureKind === "schema-failed") {
-      return { kind: "schema-failed", error, raw };
+      return { kind: "schema-failed", error, raw, ...metrics };
     }
-    return { kind: "provider-failed", error };
+    return { kind: "provider-failed", error, ...metrics };
   }
 
   private getLastAssistantText(session: AgentSession): string {
@@ -294,12 +307,10 @@ function toolCallCount(session: AgentSession): number {
   try {
     const msgs = (session as any).agent?.state?.messages;
     if (Array.isArray(msgs)) {
-      return msgs.filter(
-        (m: any) =>
-          m?.role === "assistant" &&
-          Array.isArray(m?.content) &&
-          m.content.some((c: any) => c.type === "tool_use"),
-      ).length;
+      return msgs.reduce((count: number, message: any) => {
+        if (message?.role !== "assistant" || !Array.isArray(message.content)) return count;
+        return count + message.content.filter((block: any) => block?.type === "tool_use").length;
+      }, 0);
     }
   } catch {}
   return 0;

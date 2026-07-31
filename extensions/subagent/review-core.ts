@@ -8,7 +8,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
-import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 
 import type { FilesystemMemoryRepository } from "../memory/repository.ts";
@@ -45,142 +44,124 @@ function detectBinary(raw: Buffer): boolean {
   return raw.includes(0);
 }
 
-function runGit(args: string[], cwd: string, timeoutMs = 10_000): { stdout: string; stderr: string } {
-  const result = { stdout: "", stderr: "" };
+class GitCommandError extends Error {
+  constructor(
+    message: string,
+    readonly timedOut: boolean,
+    readonly status?: number,
+  ) {
+    super(message);
+  }
+}
+
+function runGit(args: string[], cwd: string, timeoutMs = 10_000): string {
   try {
-    result.stdout = execFileSync("git", args, {
+    return execFileSync("git", args, {
       cwd,
       encoding: "utf8",
       timeout: timeoutMs,
-      maxBuffer: 10 * 1024 * 1024,
+      maxBuffer: 20 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "pipe"],
     });
-  } catch (e: any) {
-    // For diff commands, empty diff is a valid result (no changes)
-    if (e.status === 0 || e.status === undefined) {
-      result.stdout = e.stdout || "";
-      result.stderr = e.stderr || "";
-    } else {
-      result.stderr = e.stderr || e.message || String(e);
-      result.stdout = e.stdout || "";
-    }
-    // If killed by signal, it's a timeout
-    if (e.signal) {
-      throw new Error("git timeout");
-    }
+  } catch (error: any) {
+    const timedOut = Boolean(error?.signal) || error?.code === "ETIMEDOUT";
+    const stderr = Buffer.isBuffer(error?.stderr)
+      ? error.stderr.toString("utf8")
+      : String(error?.stderr || error?.message || error);
+    throw new GitCommandError(stderr.trim() || "Git command failed", timedOut, error?.status);
   }
-  return result;
+}
+
+function nulPaths(output: string): string[] {
+  return output.split("\0").filter((item) => item.length > 0);
 }
 
 export function collectGitChanges(cwd: string): CollectGitChangesResult {
-  // Check if git repo
   try {
-    execFileSync("git", ["rev-parse", "--git-dir"], { cwd, encoding: "utf8", timeout: 3000 });
-  } catch {
-    return { ok: false, kind: "not-a-git-repo", error: "Not a git repository" };
-  }
-
-  let staged: string;
-  let unstaged: string;
-  let untrackedList: string;
-
-  try {
-    staged = runGit(["diff", "--cached", "--no-ext-diff"], cwd).stdout;
-    unstaged = runGit(["diff", "--no-ext-diff"], cwd).stdout;
-    untrackedList = runGit(["ls-files", "--others", "--exclude-standard", "-z"], cwd).stdout;
-  } catch (e: any) {
-    if (e.message === "git timeout") {
+    runGit(["rev-parse", "--git-dir"], cwd, 3_000);
+  } catch (error) {
+    if (error instanceof GitCommandError && error.timedOut) {
       return { ok: false, kind: "timeout", error: "Git command timed out" };
     }
-    return { ok: false, kind: "git-failed", error: e.stderr || e.message || String(e) };
-  }
-
-  if (!staged.trim() && !unstaged.trim() && !untrackedList.trim()) {
-    return { ok: false, kind: "no-changes", error: "No changes found" };
-  }
-
-  const changes: ChangeFile[] = [];
-
-  // Process staged changes
-  if (staged.trim()) {
-    const files = extractFilePaths(staged, "staged");
-    for (const file of files) {
-      const fileDiff = extractFileDiff(staged, file);
-      changes.push(readChangeFile(file, "staged", fileDiff, cwd));
+    if (error instanceof GitCommandError && error.status === 128) {
+      return { ok: false, kind: "not-a-git-repo", error: error.message };
     }
+    return {
+      ok: false,
+      kind: "git-failed",
+      error: error instanceof Error ? error.message : String(error),
+    };
   }
 
-  // Process unstaged changes
-  if (unstaged.trim()) {
-    const files = extractFilePaths(unstaged, "unstaged");
-    for (const file of files) {
-      const fileDiff = extractFileDiff(unstaged, file);
-      // Avoid duplicating if same file also in staged
-      if (!changes.some((c) => c.path === file && c.status === "staged")) {
-        changes.push(readChangeFile(file, "unstaged", fileDiff, cwd));
-      }
+  try {
+    // NUL-delimited file discovery avoids parsing quoted/escaped human-readable diffs.
+    const stagedFiles = nulPaths(runGit([
+      "diff", "--cached", "--name-only", "-z", "--diff-filter=ACDMRTUXB",
+    ], cwd));
+    const unstagedFiles = nulPaths(runGit([
+      "diff", "--name-only", "-z", "--diff-filter=ACDMRTUXB",
+    ], cwd));
+    const untrackedFiles = nulPaths(runGit([
+      "ls-files", "--others", "--exclude-standard", "-z",
+    ], cwd));
+
+    if (stagedFiles.length === 0 && unstagedFiles.length === 0 && untrackedFiles.length === 0) {
+      return { ok: false, kind: "no-changes", error: "No changes found" };
     }
-  }
 
-  // Process untracked files
-  if (untrackedList.trim()) {
-    const files = untrackedList.split("\0").filter(Boolean);
-    for (const file of files) {
-      if (!changes.some((c) => c.path === file)) {
+    const changes: ChangeFile[] = [];
+    for (const file of stagedFiles) {
+      const diff = runGit(["diff", "--cached", "--no-ext-diff", "--binary", "--", file], cwd);
+      changes.push(readChangeFile(file, "staged", diff, cwd));
+    }
+    for (const file of unstagedFiles) {
+      // A file may have independently reviewable staged and unstaged deltas.
+      const diff = runGit(["diff", "--no-ext-diff", "--binary", "--", file], cwd);
+      changes.push(readChangeFile(file, "unstaged", diff, cwd));
+    }
+    const trackedPaths = new Set([...stagedFiles, ...unstagedFiles]);
+    for (const file of untrackedFiles) {
+      if (!trackedPaths.has(file)) {
         changes.push(readChangeFile(file, "untracked", "", cwd));
       }
     }
-  }
 
-  if (changes.length === 0) {
-    return { ok: false, kind: "no-changes", error: "No changes found" };
+    return changes.length > 0
+      ? { ok: true, changes }
+      : { ok: false, kind: "no-changes", error: "No changes found" };
+  } catch (error) {
+    if (error instanceof GitCommandError) {
+      return {
+        ok: false,
+        kind: error.timedOut ? "timeout" : "git-failed",
+        error: error.timedOut ? "Git command timed out" : error.message,
+      };
+    }
+    return { ok: false, kind: "git-failed", error: String(error) };
   }
-
-  return { ok: true, changes };
 }
 
 function readChangeFile(filePath: string, status: ChangeFile["status"], diff: string, cwd: string): ChangeFile {
-  const absolute = path.resolve(cwd, filePath);
   let content: string | undefined;
-  let binary = false;
+  let binary = /^(?:Binary files .* differ|GIT binary patch)$/m.test(diff);
   let unreadable = false;
-  let skipped = false;
+  let skipped = binary;
 
-  try {
-    const raw = fs.readFileSync(absolute);
-    binary = detectBinary(raw);
-    if (!binary) {
-      content = raw.toString("utf8");
-    } else {
+  // Tracked entries are fully represented by their patch. Reading their whole
+  // working-tree file would duplicate I/O and is incorrect for deletions.
+  if (!diff) {
+    try {
+      const raw = fs.readFileSync(path.resolve(cwd, filePath));
+      binary = detectBinary(raw);
+      if (!binary) content = raw.toString("utf8");
+      else skipped = true;
+    } catch {
+      unreadable = true;
       skipped = true;
     }
-  } catch {
-    unreadable = true;
-    skipped = true;
   }
 
   return { path: filePath, status, diff, content, binary, unreadable, skipped };
-}
-
-function extractFilePaths(diffOutput: string, status: "staged" | "unstaged"): string[] {
-  const files: string[] = [];
-  const regex = /^diff --git a\/(.+?) b\/(.+?)$/gm;
-  let match;
-  while ((match = regex.exec(diffOutput)) !== null) {
-    // For staged changes, use the "b/" path (new file)
-    // For unstaged, either works
-    const filePath = status === "staged" ? match[2] : match[2];
-    if (!files.includes(filePath)) {
-      files.push(filePath);
-    }
-  }
-  return files;
-}
-
-function extractFileDiff(diffOutput: string, filePath: string): string {
-  const escaped = filePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const regex = new RegExp(`^diff --git a\\/${escaped} b\\/${escaped}[\\s\\S]*?(?=^diff --git |\\Z)`, "m");
-  const match = diffOutput.match(regex);
-  return match ? match[0].trim() : "";
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -374,70 +355,89 @@ export interface BuildChunksResult {
 }
 
 export function buildReviewChunks(changes: ChangeFile[], maxCharsPerChunk = 12_000): BuildChunksResult {
-  const skipped: ChangeFile[] = [];
-  const chunks: ReviewChunk[] = [];
-
-  // Track skipped files
-  for (const change of changes) {
-    if (change.skipped || change.binary || change.unreadable) {
-      skipped.push(change);
-    }
+  if (!Number.isInteger(maxCharsPerChunk) || maxCharsPerChunk < 1) {
+    throw new RangeError("maxCharsPerChunk must be a positive integer");
   }
 
-  // Sort reviewable files: staged first, then unstaged, then untracked
-  const reviewable = changes.filter(
-    (c) => !c.skipped && !c.binary && !c.unreadable,
-  );
-  reviewable.sort((a, b) => {
-    const order = { staged: 0, unstaged: 1, untracked: 2 };
-    return order[a.status] - order[b.status];
-  });
+  const skipped = changes.filter((change) => change.skipped || change.binary || change.unreadable);
+  const chunks: ReviewChunk[] = [];
+  const order = { staged: 0, unstaged: 1, untracked: 2 };
+  const reviewable = changes
+    .filter((change) => !change.skipped && !change.binary && !change.unreadable)
+    .sort((a, b) => order[a.status] - order[b.status]);
 
-  let currentChunk: ReviewChunk | null = null;
+  const appendPiece = (file: string, piece: string) => {
+    const current = chunks.at(-1);
+    const separator = current ? "\n\n" : "";
+    if (!current || current.charCount + separator.length + piece.length > maxCharsPerChunk) {
+      chunks.push({
+        chunkId: `chunk-${chunks.length + 1}`,
+        files: [file],
+        content: piece,
+        charCount: piece.length,
+      });
+      return;
+    }
+    if (!current.files.includes(file)) current.files.push(file);
+    current.content += separator + piece;
+    current.charCount += separator.length + piece.length;
+  };
 
   for (const change of reviewable) {
-
-    const content = formatChangeContent(change);
-
-    if (!currentChunk) {
-      currentChunk = {
-        chunkId: `chunk-${chunks.length + 1}`,
-        files: [change.path],
-        content,
-        charCount: content.length,
-      };
-      chunks.push(currentChunk);
-      continue;
-    }
-
-    // If this file would overflow the current chunk, start a new one
-    if (currentChunk.charCount + content.length > maxCharsPerChunk) {
-      currentChunk = {
-        chunkId: `chunk-${chunks.length + 1}`,
-        files: [change.path],
-        content,
-        charCount: content.length,
-      };
-      chunks.push(currentChunk);
-    } else {
-      currentChunk.files.push(change.path);
-      currentChunk.content += "\n\n" + content;
-      currentChunk.charCount += content.length + 2;
+    for (const piece of splitChangeContent(change, maxCharsPerChunk)) {
+      appendPiece(change.path, piece);
     }
   }
 
   return { chunks, skipped };
 }
 
-function formatChangeContent(change: ChangeFile): string {
-  const parts: string[] = [];
-  parts.push(`=== File: ${change.path} (${change.status}) ===`);
-  if (change.diff) {
-    parts.push(change.diff);
-  } else if (change.content) {
-    parts.push(change.content);
+function splitChangeContent(change: ChangeFile, maxChars: number): string[] {
+  const header = `=== File: ${change.path} (${change.status}) ===`;
+  const body = change.diff || change.content || "";
+  if (!body) return [header];
+
+  const hunkPieces = splitDiffByHunk(body);
+  const pieces: string[] = [];
+  for (const hunk of hunkPieces) {
+    const prefix = `${header}\n`;
+    const available = Math.max(1, maxChars - prefix.length);
+    for (const fragment of splitTextHard(hunk, available)) {
+      // Pathological path lengths still obey the hard cap.
+      pieces.push(...splitTextHard(prefix + fragment, maxChars));
+    }
   }
-  return parts.join("\n");
+  return pieces;
+}
+
+function splitDiffByHunk(text: string): string[] {
+  const lines = text.split(/(?<=\n)/);
+  const pieces: string[] = [];
+  let current = "";
+  for (const line of lines) {
+    if (line.startsWith("@@") && current) {
+      pieces.push(current);
+      current = "";
+    }
+    current += line;
+  }
+  if (current) pieces.push(current);
+  return pieces;
+}
+
+function splitTextHard(text: string, maxChars: number): string[] {
+  if (text.length <= maxChars) return [text];
+  const pieces: string[] = [];
+  let remaining = text;
+  while (remaining.length > maxChars) {
+    const window = remaining.slice(0, maxChars + 1);
+    const newline = window.lastIndexOf("\n");
+    const cut = newline > 0 ? newline + 1 : maxChars;
+    pieces.push(remaining.slice(0, cut));
+    remaining = remaining.slice(cut);
+  }
+  if (remaining) pieces.push(remaining);
+  return pieces;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -697,49 +697,58 @@ export function aggregateFindings(
 export interface WorktreeSnapshot {
   status: string;
   fileHashes: Record<string, string>;
+  /** Snapshot errors are explicit so callers fail closed. */
+  ok?: boolean;
+  error?: string;
+  fingerprint?: string;
 }
 
 export function snapshotWorktree(cwd: string): WorktreeSnapshot {
-  let status = "";
   try {
-    status = execFileSync("git", ["status", "--porcelain=v1"], {
-      cwd, encoding: "utf8", timeout: 5000,
-    });
-  } catch {
-    return { status: "", fileHashes: {} };
-  }
+    const status = runGit(["status", "--porcelain=v1", "-z", "--untracked-files=all"], cwd, 5_000);
+    const staged = runGit(["diff", "--cached", "--no-ext-diff", "--binary"], cwd, 5_000);
+    const unstaged = runGit(["diff", "--no-ext-diff", "--binary"], cwd, 5_000);
+    const fileHashes: Record<string, string> = {};
 
-  const fileHashes: Record<string, string> = {};
-  for (const line of status.split("\n").filter(Boolean)) {
-    // Format: XY filepath
-    const filePath = line.slice(3).trim();
-    if (filePath) {
-      try {
-        const hash = execFileSync("git", ["hash-object", filePath], {
-          cwd, encoding: "utf8", timeout: 3000,
-        }).trim();
-        fileHashes[filePath] = hash;
-      } catch {
-        // file may have been deleted
-      }
+    // Tracked changes are represented by the two complete diffs. Hash untracked
+    // contents separately because ordinary git diff intentionally omits them.
+    for (const file of nulPaths(runGit(["ls-files", "--others", "--exclude-standard", "-z"], cwd, 5_000))) {
+      const raw = fs.readFileSync(path.resolve(cwd, file));
+      fileHashes[file] = createHash("sha256").update(raw).digest("hex");
     }
-  }
 
-  return { status, fileHashes };
+    const fingerprint = createHash("sha256")
+      .update(status)
+      .update("\0staged\0")
+      .update(staged)
+      .update("\0unstaged\0")
+      .update(unstaged)
+      .update("\0untracked\0")
+      .update(JSON.stringify(Object.entries(fileHashes).sort(([a], [b]) => a.localeCompare(b))))
+      .digest("hex");
+    return { ok: true, status, fileHashes, fingerprint };
+  } catch (error) {
+    return {
+      ok: false,
+      status: "",
+      fileHashes: {},
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
 }
 
 export function compareWorktreeSnapshots(before: WorktreeSnapshot, after: WorktreeSnapshot): boolean {
+  if (before.ok === false || after.ok === false) return true;
+  if (before.fingerprint !== undefined || after.fingerprint !== undefined) {
+    return before.fingerprint !== after.fingerprint;
+  }
   if (before.status !== after.status) return true;
 
   const beforeKeys = Object.keys(before.fileHashes);
   const afterKeys = Object.keys(after.fileHashes);
   if (beforeKeys.length !== afterKeys.length) return true;
 
-  for (const key of beforeKeys) {
-    if (before.fileHashes[key] !== after.fileHashes[key]) return true;
-  }
-
-  return false;
+  return beforeKeys.some((key) => before.fileHashes[key] !== after.fileHashes[key]);
 }
 
 // ═══════════════════════════════════════════════════════════════

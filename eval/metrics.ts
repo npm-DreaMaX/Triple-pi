@@ -75,13 +75,12 @@ export function evaluateRecords(testCase: EvalCase, records: MemoryRecord[]): Ev
   const failures: string[] = [];
 
   // ── Phase 1: one-to-one matching ──
-  const usedExpected = new Set<number>();
-  const usedRecordIndices = new Set<number>();
+  const matchedRecordIndices = new Set<number>();
+  const recordToExpected = new Map<number, number>();
 
   for (let ei = 0; ei < testCase.expected.length; ei++) {
-    if (usedExpected.has(ei)) continue;
     for (let ri = 0; ri < records.length; ri++) {
-      if (usedRecordIndices.has(ri)) continue;
+      if (matchedRecordIndices.has(ri)) continue;
       if (matchesExpected(records[ri], testCase.expected[ei])) {
         // Evidence grounding: verify provenance.evidence contains quotes
         // that are verbatim substrings of user input
@@ -94,74 +93,49 @@ export function evaluateRecords(testCase: EvalCase, records: MemoryRecord[]): Ev
           // Skip this match — evidence not grounded in user input
           continue;
         }
-        usedExpected.add(ei);
-        usedRecordIndices.add(ri);
+        matchedRecordIndices.add(ri);
+        recordToExpected.set(ri, ei);
         break;
       }
     }
   }
 
-  // ── Phase 2: check TP records for forbidden content ──
-  // Temporarily assume matched records are TP; then check each for forbidden.
-  const tpRecordIndices = new Set(usedRecordIndices);
+  // ── Phase 2: find forbidden content and demote every contaminated match ──
   const forbiddenLower = testCase.forbidden.map((f) => f.toLocaleLowerCase());
+  const forbiddenRecordIndices = new Set<number>();
+  const forbiddenTermIndices = new Set<number>();
 
-  for (const ri of usedRecordIndices) {
-    const text = `${records[ri].title}\n${records[ri].content}`.toLocaleLowerCase();
-    const hitForbidden = forbiddenLower.some((f) => text.includes(f));
-    if (hitForbidden) {
-      // Demote from TP: the matched record also violates policy
-      tpRecordIndices.delete(ri);
-      usedExpected.delete(
-        [...usedExpected].find((ei) => matchesExpected(records[ri], testCase.expected[ei])) ?? -1,
-      );
-      failures.push(`Matched record also contains forbidden content: ${records[ri].title}`);
-      break; // only one demotion needed — consistency of the set
-    }
+  records.forEach((record, ri) => {
+    const text = `${record.title}\n${record.content}`.toLocaleLowerCase();
+    forbiddenLower.forEach((forbidden, fi) => {
+      if (text.includes(forbidden)) {
+        forbiddenRecordIndices.add(ri);
+        forbiddenTermIndices.add(fi);
+      }
+    });
+  });
+
+  for (const ri of forbiddenRecordIndices) {
+    if (!recordToExpected.delete(ri)) continue;
+    failures.push(`Matched record also contains forbidden content: ${records[ri].title}`);
   }
 
   // ── Phase 3: count TP, FN, FP ──
-  const truePositive = tpRecordIndices.size;
-  const falseNegative = testCase.expected.length - usedExpected.size;
+  const truePositive = recordToExpected.size;
+  const falseNegative = testCase.expected.length - recordToExpected.size;
 
-  // FP = unmatched records + one forbidden penalty if applicable
+  // FP = unmatched records + one forbidden penalty if applicable. Contaminated
+  // matches remain matched here: their corresponding expected slots already
+  // count as FN, while forbidden content is penalized once at prediction level.
   const unmatchedRecords = records
-    .map((r, i) => ({ r, i }))
-    .filter(({ i }) => !usedRecordIndices.has(i))
-    .map(({ r }) => r);
+    .filter((_, ri) => !matchedRecordIndices.has(ri));
 
-  let falsePositive = unmatchedRecords.length;
+  const forbiddenFP = forbiddenRecordIndices.size > 0;
+  const falsePositive = unmatchedRecords.length + (forbiddenFP ? 1 : 0);
   const fpRecordTitles: string[] = unmatchedRecords.map((r) => r.title);
 
-  // Check remaining records (including demoted ones) for forbidden content
-  const forbiddenHitRecords = records.filter((r, ri) => {
-    if (!tpRecordIndices.has(ri)) {
-      const text = `${r.title}\n${r.content}`.toLocaleLowerCase();
-      return forbiddenLower.some((f) => text.includes(f));
-    }
-    return false;
-  });
-
-  let forbiddenFP = false;
-  if (forbiddenHitRecords.length > 0) {
-    forbiddenFP = true;
-    // Only add ONE prediction-level FP, not per-record or per-term
-    falsePositive += 1;
-  }
-
-  for (const forbidden of testCase.forbidden) {
-    const foundAnywhere = records.some((r) => {
-      if (!tpRecordIndices.has(records.indexOf(r)) || !tpRecordIndices.size) {
-        return `${r.title}\n${r.content}`.toLocaleLowerCase().includes(forbidden.toLocaleLowerCase());
-      }
-      return false;
-    }) || records.some((r, ri) => {
-      if (tpRecordIndices.has(ri)) return false;
-      return `${r.title}\n${r.content}`.toLocaleLowerCase().includes(forbidden.toLocaleLowerCase());
-    });
-    if (foundAnywhere) {
-      failures.push(`Forbidden content persisted: ${forbidden}`);
-    }
+  for (const fi of forbiddenTermIndices) {
+    failures.push(`Forbidden content persisted: ${testCase.forbidden[fi]}`);
   }
 
   // ── Phase 4: metrics ──

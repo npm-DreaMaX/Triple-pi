@@ -66,6 +66,28 @@ describe("extraction coordinator", () => {
     });
   });
 
+  it("stores exact requested/resolved scope decisions with grounding evidence", async () => {
+    const scoped = snapshot();
+    scoped.branch[0] = {
+      ...(scoped.branch[0] as any),
+      message: { role: "user", content: "Always use strict TypeScript.", timestamp: 0 },
+    } as any;
+    provider.extractCandidateJson.mockResolvedValue(JSON.stringify([{
+      category: "rule", title: "Strict TypeScript", content: "Use strict TypeScript.",
+      evidence: "Always use strict TypeScript.", sourceEntryId: "u1", scope: "global",
+    }]));
+
+    await runExtraction(repository, scoped, new AbortController().signal);
+    const record = (await repository.list(cwd))[0];
+    expect(record.scope).toBe("project");
+    expect(record.provenance.scopeDecision).toMatchObject({
+      requested: "global",
+      resolved: "project",
+      reason: "missing-cross-project-evidence",
+      evidence: { sourceEntryId: "u1", role: "user", quote: "Always use strict TypeScript." },
+    });
+  });
+
   it("does not persist candidates removed by review", async () => {
     provider.extractCandidateJson.mockResolvedValue(JSON.stringify([{
       category: "rule", title: "Strict TypeScript", content: "Use strict TypeScript for this project.",

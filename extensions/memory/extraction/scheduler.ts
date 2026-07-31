@@ -14,7 +14,27 @@ export interface SchedulerJob {
 }
 
 export interface ExtractionDiagnosticsCallback {
-  onFailure?: (stage: string, code: string, error: unknown) => void;
+  onAttempt?: (snapshot: ExtractionSnapshot) => void;
+  onSuccess?: (snapshot: ExtractionSnapshot) => void;
+  onFailure?: (stage: string, code: string, error: unknown, snapshot: ExtractionSnapshot) => void;
+}
+
+function isSameBranchLine(
+  ancestor: Pick<ExtractionSnapshot, "sessionId" | "branchLeafId">,
+  descendant: ExtractionSnapshot,
+): boolean {
+  if (ancestor.sessionId !== descendant.sessionId) return false;
+  if (ancestor.branchLeafId === descendant.branchLeafId) return true;
+  if (ancestor.branchLeafId === null) return true;
+  const entries = new Map(descendant.branch.map((entry) => [entry.id, entry]));
+  let cursor = descendant.branchLeafId;
+  const seen = new Set<string>();
+  while (cursor && !seen.has(cursor)) {
+    if (cursor === ancestor.branchLeafId) return true;
+    seen.add(cursor);
+    cursor = entries.get(cursor)?.parentId ?? null;
+  }
+  return false;
 }
 
 export class ExtractionScheduler {
@@ -23,6 +43,11 @@ export class ExtractionScheduler {
   private generation = 0;
   private pending: ExtractionSnapshot | undefined;
   private currentJob: SchedulerJob | undefined;
+  private lastSuccessful: {
+    checkpoint: ExtractionCheckpoint;
+    sessionId: string;
+    branchLeafId: string | null;
+  } | undefined;
   private diagnosticsCallbacks: ExtractionDiagnosticsCallback[] = [];
 
   /** Register an extraction-failure diagnostics callback. */
@@ -39,19 +64,23 @@ export class ExtractionScheduler {
   ): void {
     const gen = this.generation;
     if (this.task || this.abort) {
-      // Merge pending only when same session AND same branch ancestor
-      if (
-        this.pending &&
-        this.pending.sessionId === snapshot.sessionId
-      ) {
-        // Carry forward the lastProcessedEntryId so the delta offset is preserved
-        if (this.currentJob) {
-          (snapshot as { lastProcessedEntryId?: string }).lastProcessedEntryId =
-            this.pending.lastProcessedEntryId;
-        }
+      const base = this.pending ?? this.currentJob?.snapshot;
+      if (base && isSameBranchLine(base, snapshot)) {
+        snapshot.lastProcessedEntryId = base.lastProcessedEntryId;
       }
       this.pending = snapshot;
+      repository.updateExtractionDiagnostics({ running: true, pending: true });
       return;
+    }
+    if (
+      this.lastSuccessful &&
+      isSameBranchLine(this.lastSuccessful, snapshot)
+    ) {
+      snapshot.lastProcessedEntryId = this.lastSuccessful.checkpoint.lastEntryId;
+    }
+    repository.updateExtractionDiagnostics({ running: true, pending: false, attempted: true });
+    for (const cb of this.diagnosticsCallbacks) {
+      try { cb.onAttempt?.(snapshot); } catch {}
     }
     const controller = new AbortController();
     this.abort = controller;
@@ -79,16 +108,39 @@ export class ExtractionScheduler {
             (result.checkpoint as { savedCount: number }).savedCount =
               result.savedCount;
           }
+          this.lastSuccessful = {
+            checkpoint: result.checkpoint,
+            sessionId: snapshot.sessionId,
+            branchLeafId: snapshot.branchLeafId,
+          };
+          repository.updateExtractionDiagnostics({ succeeded: true });
           appendCheckpoint(result.checkpoint);
+          for (const cb of this.diagnosticsCallbacks) {
+            try { cb.onSuccess?.(snapshot); } catch {}
+          }
         }
       })
       .catch((error) => {
-        // Extraction is fail-closed. Notify diagnostics callbacks.
-        for (const cb of this.diagnosticsCallbacks) {
-          try {
-            cb.onFailure?.("extraction", "EXTRACTION_FAILED", error);
-          } catch {
-            // Diagnostics must not throw.
+        // A cancelled task that was aborted by the scheduler itself (tree switch,
+        // shutdown, cancel) is expected lifecycle, not a real failure.
+        if (controller.signal.aborted) {
+          repository.updateExtractionDiagnostics({ running: false });
+        } else {
+          repository.updateExtractionDiagnostics({
+            failureStage: "extraction",
+            failureCode: "EXTRACTION_FAILED",
+          });
+        }
+
+        // Extraction is fail-closed. Notify diagnostics callbacks if it wasn't
+        // an intentional abort (callbacks may still fire for real failures).
+        if (!controller.signal.aborted) {
+          for (const cb of this.diagnosticsCallbacks) {
+            try {
+              cb.onFailure?.("extraction", "EXTRACTION_FAILED", error, snapshot);
+            } catch {
+              // Diagnostics must not throw.
+            }
           }
         }
       })
@@ -98,6 +150,7 @@ export class ExtractionScheduler {
         this.task = undefined;
         const next = this.pending;
         this.pending = undefined;
+        repository.updateExtractionDiagnostics({ running: false, pending: next !== undefined });
         onSettled();
         if (next) this.start(next, repository, appendCheckpoint, onSettled);
       });
@@ -109,12 +162,16 @@ export class ExtractionScheduler {
     this.abort?.abort();
     this.pending = undefined;
     this.currentJob = undefined;
+    this.lastSuccessful = undefined;
   }
 
-  /** Increment generation (for tree switches) — abort current but keep pending. */
+  /** Invalidate all work from the previous tree, including queued snapshots. */
   bumpGeneration(): void {
     this.generation += 1;
     this.abort?.abort();
+    this.pending = undefined;
+    this.currentJob = undefined;
+    this.lastSuccessful = undefined;
   }
 
   /** Flush and wait up to 1s for shutdown. */
@@ -122,6 +179,7 @@ export class ExtractionScheduler {
     this.generation += 1;
     this.pending = undefined;
     this.currentJob = undefined;
+    this.lastSuccessful = undefined;
     this.abort?.abort();
     if (this.task) {
       await Promise.race([
@@ -133,5 +191,9 @@ export class ExtractionScheduler {
 
   get isRunning(): boolean {
     return this.task !== undefined;
+  }
+
+  get hasPending(): boolean {
+    return this.pending !== undefined;
   }
 }

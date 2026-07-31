@@ -35,6 +35,8 @@ const DEFAULT_PROMPT_CHAR_LIMIT = 12_000;
 export interface MemoryRepositoryOptions {
   root?: string;
   now?: () => Date;
+  /** Test seam for deterministic write-failure injection. */
+  beforeWrite?: (filepath: string) => void | Promise<void>;
 }
 
 export interface SaveMemoryInput {
@@ -256,10 +258,47 @@ async function exists(filepath: string): Promise<boolean> {
 export class FilesystemMemoryRepository {
   readonly root: string;
   private readonly now: () => Date;
+  private readonly beforeWrite?: (filepath: string) => void | Promise<void>;
+  private extractionRunning = false;
+  private extractionPending = false;
+  private lastExtractionAttemptAt?: string;
+  private lastExtractionSuccessAt?: string;
+  private lastExtractionFailureAt?: string;
+  private lastExtractionFailureStage?: string;
+  private lastExtractionFailureCode?: string;
+  private consecutiveExtractionFailures = 0;
+  private rollbackFailureCount = 0;
 
   constructor(options: MemoryRepositoryOptions = {}) {
     this.root = path.resolve(options.root || defaultRoot());
     this.now = options.now || (() => new Date());
+    this.beforeWrite = options.beforeWrite;
+  }
+
+  updateExtractionDiagnostics(update: {
+    running?: boolean;
+    pending?: boolean;
+    attempted?: boolean;
+    succeeded?: boolean;
+    failureStage?: string;
+    failureCode?: string;
+  }): void {
+    const timestamp = this.now().toISOString();
+    if (update.running !== undefined) this.extractionRunning = update.running;
+    if (update.pending !== undefined) this.extractionPending = update.pending;
+    if (update.attempted) this.lastExtractionAttemptAt = timestamp;
+    if (update.succeeded) {
+      this.lastExtractionSuccessAt = timestamp;
+      this.consecutiveExtractionFailures = 0;
+      this.lastExtractionFailureStage = undefined;
+      this.lastExtractionFailureCode = undefined;
+    }
+    if (update.failureStage || update.failureCode) {
+      this.lastExtractionFailureAt = timestamp;
+      this.lastExtractionFailureStage = update.failureStage;
+      this.lastExtractionFailureCode = update.failureCode;
+      this.consecutiveExtractionFailures += 1;
+    }
   }
 
   async save(input: SaveMemoryInput): Promise<MemoryRecord> {
@@ -291,11 +330,14 @@ export class FilesystemMemoryRepository {
       const previous = await this.readFileIfPresent(filepath);
       const timestamp = this.now().toISOString();
 
-      // If updating an existing record, create an immutable revision snapshot first
-      if (previous) {
+      const previousRevisionId = previous?.provenance.revision?.revisionId ?? (previous ? randomUUID() : undefined);
+      const headRevisionId = randomUUID();
+
+      // The snapshot ID is exactly the prior head pointer, making the chain traversable.
+      if (previous && previousRevisionId) {
         const revision: MemoryRevision = {
           schemaVersion: 2,
-          revisionId: randomUUID(),
+          revisionId: previousRevisionId,
           recordId: id,
           title: previous.title,
           content: previous.content,
@@ -303,14 +345,9 @@ export class FilesystemMemoryRepository {
           createdAt: previous.createdAt,
           capturedAt: timestamp,
         };
-        const revisionDir = path.join(
-          this.basePath(input.scope, project.id),
-          "revisions",
-          id,
-        );
-        await fs.mkdir(revisionDir, { recursive: true, mode: 0o700 });
+        const revisionDir = path.join(this.basePath(input.scope, project.id), "revisions", id);
         await this.atomicWrite(
-          path.join(revisionDir, `${revision.revisionId}.md`),
+          path.join(revisionDir, `${previousRevisionId}.md`),
           `${JSON.stringify(revision, null, 2)}\n`,
         );
       }
@@ -325,19 +362,14 @@ export class FilesystemMemoryRepository {
         content,
         createdAt: previous?.createdAt || timestamp,
         updatedAt: timestamp,
-        provenance: input.provenance || { source: "manual" },
-      };
-
-      // Wire revision pointer into the new record's provenance
-      if (previous) {
-        record.provenance = {
-          ...record.provenance,
+        provenance: {
+          ...(input.provenance || { source: "manual" }),
           revision: {
-            revisionId: randomUUID(),
-            previousRevisionId: previous.provenance?.revision?.revisionId,
+            revisionId: headRevisionId,
+            previousRevisionId,
           },
-        };
-      }
+        },
+      };
 
       await this.atomicWrite(filepath, serializeRecord(record));
       if (input.scope === "project") {
@@ -404,8 +436,14 @@ export class FilesystemMemoryRepository {
         lifecycle: "new", inactivityDays: 0, longTermCount: 0,
         hasScratchpad: false, hasRecentDaily: false,
         extractionManifestCount: 0, workingManifestCount: 0, permissions: "missing",
-        extractionRunning: false, extractionPending: false,
-        consecutiveExtractionFailures: 0, corruptRecordCount: 0, rollbackFailureCount: 0,
+        extractionRunning: this.extractionRunning, extractionPending: this.extractionPending,
+        lastExtractionAttemptAt: this.lastExtractionAttemptAt,
+        lastExtractionSuccessAt: this.lastExtractionSuccessAt,
+        lastExtractionFailureAt: this.lastExtractionFailureAt,
+        lastExtractionFailureStage: this.lastExtractionFailureStage,
+        lastExtractionFailureCode: this.lastExtractionFailureCode,
+        consecutiveExtractionFailures: this.consecutiveExtractionFailures,
+        corruptRecordCount: 0, rollbackFailureCount: this.rollbackFailureCount,
       };
     }
 
@@ -471,11 +509,16 @@ export class FilesystemMemoryRepository {
       extractionManifestCount: await countJson(path.join(this.root, "extractions", project.id)),
       workingManifestCount: await countJson(path.join(this.root, "working-manifests", project.id)),
       permissions: (await fs.stat(this.root)).mode.toString(8).slice(-3),
-      extractionRunning: false,
-      extractionPending: false,
-      consecutiveExtractionFailures: 0,
+      extractionRunning: this.extractionRunning,
+      extractionPending: this.extractionPending,
+      lastExtractionAttemptAt: this.lastExtractionAttemptAt,
+      lastExtractionSuccessAt: this.lastExtractionSuccessAt,
+      lastExtractionFailureAt: this.lastExtractionFailureAt,
+      lastExtractionFailureStage: this.lastExtractionFailureStage,
+      lastExtractionFailureCode: this.lastExtractionFailureCode,
+      consecutiveExtractionFailures: this.consecutiveExtractionFailures,
       corruptRecordCount: recordsResult.corruptRecordCount,
-      rollbackFailureCount: 0,
+      rollbackFailureCount: this.rollbackFailureCount,
     };
   }
 
@@ -602,11 +645,14 @@ export class FilesystemMemoryRepository {
         stagedPaths.add(filepath);
         const previous = await this.readFileIfPresent(filepath);
 
-        // If replacing an existing record, capture an immutable revision snapshot
-        if (previous) {
+        const previousRevisionId = previous?.provenance.revision?.revisionId ?? (previous ? randomUUID() : undefined);
+        const headRevisionId = randomUUID();
+
+        // If replacing an existing record, snapshot it under its prior head ID.
+        if (previous && previousRevisionId) {
           const revision: MemoryRevision = {
             schemaVersion: 2,
-            revisionId: randomUUID(),
+            revisionId: previousRevisionId,
             recordId: id,
             title: previous.title,
             content: previous.content,
@@ -638,12 +684,10 @@ export class FilesystemMemoryRepository {
             ...input.provenance,
             source: "extraction",
             sourceHash,
-            revision: previous?.provenance?.revision
-              ? {
-                  revisionId: randomUUID(),
-                  previousRevisionId: previous.provenance.revision.revisionId,
-                }
-              : undefined,
+            revision: {
+              revisionId: headRevisionId,
+              previousRevisionId,
+            },
           },
         };
         staged.push({ filepath, record, revisionContent: undefined });
@@ -686,11 +730,7 @@ export class FilesystemMemoryRepository {
       reinforcementContent = `${JSON.stringify(nextReinforcement, null, 2)}\n`;
       writeOrder.push({ target: reinforcementFile, content: reinforcementContent });
 
-      // 4. Project metadata (project.json)
-      if (entries.some((entry) => entry.scope === "project")) {
-        const meta = await this.writeActiveMetadataUnlocked(project);
-        // Already written; we'll back it up during the write phase
-      }
+      // 4. Project metadata is prepared and written only after every backup exists.
 
       // 5. Manifest (committed LAST as authoritative publish point)
       const manifestContent = `${JSON.stringify({ sourceHash, projectId: project.id, recordIds: staged.filter((s) => s.revisionContent === undefined).map((item) => item.record.id), committedAt: timestamp }, null, 2)}\n`;
@@ -740,25 +780,23 @@ export class FilesystemMemoryRepository {
         // Roll back project.json if it was part of the batch
         if (projectJson) {
           const prevMeta = backups.get(projectJson);
-          if (prevMeta !== undefined) {
-            try {
-              await this.atomicWrite(projectJson, prevMeta);
-            } catch (e) {
-              rollbackErrors.push(e instanceof Error ? e : new Error(String(e)));
-            }
-          }
-        }
-        // Roll back manifest
-        const prevManifest = backups.get(manifestFile);
-        if (prevManifest !== undefined) {
           try {
-            await this.atomicWrite(manifestFile, prevManifest);
+            if (prevMeta === undefined) await fs.rm(projectJson, { force: true });
+            else await this.atomicWrite(projectJson, prevMeta);
           } catch (e) {
             rollbackErrors.push(e instanceof Error ? e : new Error(String(e)));
           }
         }
-        // Attach rollback errors to the original error
+        // Roll back manifest
+        const prevManifest = backups.get(manifestFile);
+        try {
+          if (prevManifest === undefined) await fs.rm(manifestFile, { force: true });
+          else await this.atomicWrite(manifestFile, prevManifest);
+        } catch (e) {
+          rollbackErrors.push(e instanceof Error ? e : new Error(String(e)));
+        }
         if (rollbackErrors.length > 0) {
+          this.rollbackFailureCount += rollbackErrors.length;
           (error as any).rollbackErrors = rollbackErrors;
         }
         throw error;
@@ -1027,21 +1065,19 @@ export class FilesystemMemoryRepository {
   async listRevisions(recordId: string, cwd: string): Promise<MemoryRevision[]> {
     if (!/^[a-f0-9]{32}$/.test(recordId)) return [];
     const project = resolveProjectIdentity(cwd);
-    const base = this.basePath("project", project.id);
-    const revisionDir = path.join(base, "revisions", recordId);
-    if (!(await exists(revisionDir))) return [];
-
     const revisions: MemoryRevision[] = [];
-    for (const entry of await fs.readdir(revisionDir, { withFileTypes: true })) {
-      if (!entry.isFile() || !entry.name.endsWith(".md")) continue;
-      try {
-        const raw = await fs.readFile(path.join(revisionDir, entry.name), "utf8");
-        const rev = JSON.parse(raw) as MemoryRevision;
-        if (rev.schemaVersion === 2 && rev.recordId === recordId) {
-          revisions.push(rev);
+    for (const scope of ["project", "global"] as const) {
+      const revisionDir = path.join(this.basePath(scope, project.id), "revisions", recordId);
+      if (!(await exists(revisionDir))) continue;
+      for (const entry of await fs.readdir(revisionDir, { withFileTypes: true })) {
+        if (!entry.isFile() || !entry.name.endsWith(".md")) continue;
+        try {
+          const raw = await fs.readFile(path.join(revisionDir, entry.name), "utf8");
+          const rev = JSON.parse(raw) as MemoryRevision;
+          if (rev.schemaVersion === 2 && rev.recordId === recordId) revisions.push(rev);
+        } catch {
+          // Corrupt revision — skip
         }
-      } catch {
-        // Corrupt revision — skip
       }
     }
     return revisions.sort((a, b) => a.capturedAt.localeCompare(b.capturedAt));
@@ -1051,17 +1087,16 @@ export class FilesystemMemoryRepository {
   async getRevision(recordId: string, revisionId: string, cwd: string): Promise<MemoryRevision | undefined> {
     if (!/^[a-f0-9]{32}$/.test(recordId) || !revisionId) return undefined;
     const project = resolveProjectIdentity(cwd);
-    const revisionDir = path.join(this.basePath("project", project.id), "revisions", recordId);
-    const filepath = path.join(revisionDir, `${revisionId}.md`);
-    if (!(await exists(filepath))) return undefined;
-    try {
-      const raw = await fs.readFile(filepath, "utf8");
-      const rev = JSON.parse(raw) as MemoryRevision;
-      if (rev.schemaVersion === 2 && rev.recordId === recordId && rev.revisionId === revisionId) {
-        return rev;
+    for (const scope of ["project", "global"] as const) {
+      const filepath = path.join(this.basePath(scope, project.id), "revisions", recordId, `${revisionId}.md`);
+      if (!(await exists(filepath))) continue;
+      try {
+        const raw = await fs.readFile(filepath, "utf8");
+        const rev = JSON.parse(raw) as MemoryRevision;
+        if (rev.schemaVersion === 2 && rev.recordId === recordId && rev.revisionId === revisionId) return rev;
+      } catch {
+        // Corrupt revision
       }
-    } catch {
-      // Corrupt revision
     }
     return undefined;
   }
@@ -1230,6 +1265,7 @@ export class FilesystemMemoryRepository {
   }
 
   private async atomicWrite(filepath: string, content: string): Promise<void> {
+    await this.beforeWrite?.(filepath);
     const dir = path.dirname(filepath);
     await fs.mkdir(dir, { recursive: true, mode: 0o700 });
     await fs.chmod(dir, 0o700);

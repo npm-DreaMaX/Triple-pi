@@ -19,6 +19,7 @@ export type ReviewerFailureKind =
   | "timeout"
   | "aborted"
   | "worktree-changed"
+  | "unreviewable-changes"
   | "no-changes";
 
 export type ReviewCoverage = "partial" | "complete";
@@ -28,6 +29,10 @@ export interface ReviewerTelemetry {
   parsedChunks: number;
   failedChunks: number;
   worktreeChanged: boolean;
+  /** Files omitted from model input (for example binary or unreadable files). */
+  skippedFiles?: number;
+  /** Original failure kinds from chunks that did not complete. */
+  failureKinds?: ReviewerFailureKind[];
 }
 
 export interface SubagentTask {
@@ -83,18 +88,23 @@ export interface SubagentResult {
 /**
  * 判别联合结果类型，Manager.review() 的主返回值
  */
+export interface ReviewExecutionMetrics {
+  durationMs?: number;
+  toolCalls?: number;
+}
+
 export type ReviewResultUnion =
   | { kind: "no-changes"; message: string }
   | { kind: "success"; result: SubagentResult }
   | { kind: "partial"; result: SubagentResult }
-  | { kind: "git-failed"; error: string }
-  | { kind: "session-create-failed"; error: string }
-  | { kind: "provider-failed"; error: string }
-  | { kind: "parse-failed"; error: string; raw: string }
-  | { kind: "schema-failed"; error: string; raw: string }
-  | { kind: "timeout" }
-  | { kind: "aborted" }
-  | { kind: "worktree-changed" };
+  | ({ kind: "git-failed"; error: string } & ReviewExecutionMetrics)
+  | ({ kind: "session-create-failed"; error: string } & ReviewExecutionMetrics)
+  | ({ kind: "provider-failed"; error: string } & ReviewExecutionMetrics)
+  | ({ kind: "parse-failed"; error: string; raw: string } & ReviewExecutionMetrics)
+  | ({ kind: "schema-failed"; error: string; raw: string } & ReviewExecutionMetrics)
+  | ({ kind: "timeout" } & ReviewExecutionMetrics)
+  | ({ kind: "aborted" } & ReviewExecutionMetrics)
+  | ({ kind: "worktree-changed" } & ReviewExecutionMetrics);
 
 /**
  * Git 变更文件描述

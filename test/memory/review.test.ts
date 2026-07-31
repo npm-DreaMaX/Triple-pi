@@ -3,7 +3,8 @@ import { reviewCandidates } from "../../extensions/memory/extraction/review.ts";
 
 const candidate = {
   category: "rule" as const, title: "Strict TypeScript", content: "Use strict TypeScript.",
-  evidence: "Always use strict TypeScript.", sourceEntryId: "u1", scope: "project" as const,
+  evidence: "Always use strict TypeScript.", sourceEntryId: "u1",
+  requestedScope: "project" as const, resolvedScope: "project" as const, scope: "project" as const,
 };
 const source = {
   messages: [{ entryId: "u1", role: "user" as const, content: candidate.evidence, timestamp: "2026-01-01" }],

@@ -31,6 +31,11 @@ export interface ExtractedCandidate {
   content: string;
   evidence: string;
   sourceEntryId: string;
+  /** Scope requested by the extraction provider before policy enforcement. */
+  requestedScope: MemoryScope;
+  /** Scope accepted after deterministic cross-project evidence checks. */
+  resolvedScope: MemoryScope;
+  /** @deprecated Use resolvedScope. Retained for compatibility with consolidation callers. */
   scope: MemoryScope;
 }
 
@@ -123,6 +128,8 @@ export function validateCandidates(raw: string, source: ExtractionSource): Extra
       content: content.trim(),
       evidence,
       sourceEntryId,
+      requestedScope: scope,
+      resolvedScope: validatedScope,
       scope: validatedScope,
     });
   }

@@ -18,13 +18,22 @@ import {
   searchRelevantMemories,
   buildReviewChunks,
   buildReviewerInput,
-  buildDiffString,
   formatRelevantMemories,
   snapshotWorktree,
   compareWorktreeSnapshots,
   aggregateFindings,
 } from "./review-core.ts";
-import type { ReviewResultUnion, SubagentResult, ReviewCoverage } from "./types.ts";
+import type {
+  ParseFailure,
+  ParseSuccess,
+} from "./review-core.ts";
+import type {
+  ReviewerFailureKind,
+  ReviewResultUnion,
+  SubagentResult,
+} from "./types.ts";
+
+const REVIEW_DEADLINE_MS = 120_000;
 
 function textBlock(content: string) {
   return { type: "text" as const, text: content };
@@ -104,6 +113,8 @@ export function registerSubagentExtension(
     async execute(_id, params, signal, _onUpdate, ctx) {
       const { task } = params as { task: string };
       if (!ctx.model) return { content: [textBlock("无可用模型。")], details: { status: "failed" } };
+      const reviewStartedAt = Date.now();
+      const deadlineAt = reviewStartedAt + REVIEW_DEADLINE_MS;
 
       // ── 1. Collect git changes ──
       const gitResult = collectGitChanges(ctx.cwd);
@@ -130,6 +141,12 @@ export function registerSubagentExtension(
 
       // ── 2. Snapshot worktree ──
       const worktreeBefore = snapshotWorktree(ctx.cwd);
+      if (worktreeBefore.ok === false) {
+        return {
+          content: [textBlock(`无法创建工作目录快照：${worktreeBefore.error || "未知错误"}`)],
+          details: { status: "worktree-changed", failureKind: "worktree-changed" },
+        };
+      }
 
       // ── 3. Extract search terms ──
       const terms = extractReviewSearchTerms(task, changes);
@@ -149,25 +166,40 @@ export function registerSubagentExtension(
       }
 
       const memoryStr = formatRelevantMemories(memoryHits.hits);
-      const diffStr = buildDiffString(changes);
 
       // ── 5. Build review chunks ──
       const { chunks, skipped } = buildReviewChunks(changes);
 
       if (chunks.length === 0) {
         return {
-          content: [textBlock("没有可审查的变更（所有文件均为 binary/unreadable）。")],
-          details: { status: "no-changes" },
+          content: [textBlock("存在变更，但没有任何可审查的文本内容（文件为 binary/unreadable）。审查失败。")],
+          details: {
+            status: "failed",
+            failureKind: "unreviewable-changes",
+            coverage: "partial",
+            skippedFiles: skipped.map((change) => change.path),
+          },
         };
       }
 
-      // ── 6. Process each chunk via manager ──
-      const chunkResults: Array<{
-        chunkId: string;
-        result: ReturnType<typeof parseReviewOutput>;
-      }> = [];
+      // ── 6. Process each chunk serially under one global deadline ──
+      const chunkResults: Array<{ chunkId: string; result: ParseSuccess | ParseFailure }> = [];
+      const failures: ReviewerFailureKind[] = [];
+      let totalDurationMs = 0;
+      let totalToolCalls = 0;
 
-      for (const chunk of chunks) {
+      for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
+        const chunk = chunks[chunkIndex];
+        const remainingMs = deadlineAt - Date.now();
+        if (remainingMs <= 0) {
+          failures.push("timeout");
+          chunkResults.push({
+            chunkId: chunk.chunkId,
+            result: { ok: false, failure: "timeout", error: "Global review deadline exceeded", raw: "" },
+          });
+          continue;
+        }
+
         const input = buildReviewerInput({
           task,
           diff: chunk.content,
@@ -184,84 +216,79 @@ export function registerSubagentExtension(
           model: ctx.model,
           modelRegistry: ctx.modelRegistry,
           signal: signal || ctx.signal,
-          timeoutMs: 120_000,
-          chunkCount: chunks.length,
+          timeoutMs: remainingMs,
+          chunkCount: 1,
         });
+        const converted = reviewResultToParseResult(result);
+        chunkResults.push({ chunkId: chunk.chunkId, result: converted.result });
+        totalDurationMs += converted.durationMs;
+        totalToolCalls += converted.toolCalls;
+        if (!converted.result.ok) failures.push(converted.result.failure);
 
-        // Extract parsing result from the manager response
-        let parseOk = false;
-        if (result.kind === "success" || result.kind === "partial") {
-          parseOk = result.result.findings.length > 0 || result.result.summary !== "";
+        if ((signal || ctx.signal)?.aborted) {
+          if (converted.result.ok || converted.result.failure !== "aborted") failures.push("aborted");
+          for (const remaining of chunks.slice(chunkIndex + 1)) {
+            chunkResults.push({
+              chunkId: remaining.chunkId,
+              result: { ok: false, failure: "aborted", error: "Review aborted", raw: "" },
+            });
+          }
+          break;
         }
-
-        chunkResults.push({
-          chunkId: chunk.chunkId,
-          result: {
-            ok: parseOk,
-            status: parseOk
-              ? (result.kind === "success" || result.kind === "partial"
-                  ? (result.result.findings.length > 0 ? "issues_found" : "passed")
-                  : "passed")
-              : "failed",
-            summary: (result.kind === "success" || result.kind === "partial") ? result.result.summary : "",
-            findings: (result.kind === "success" || result.kind === "partial") ? result.result.findings : [],
-            failure: parseOk ? undefined : "parse-failed",
-            error: parseOk ? undefined : "Chunk processing failed",
-            raw: "",
-          } as any,
-        });
-
-        // Stop early if aborted
-        if ((signal || ctx.signal)?.aborted) break;
       }
 
       // ── 7. Check worktree unchanged ──
       const worktreeAfter = snapshotWorktree(ctx.cwd);
-      const worktreeChanged = compareWorktreeSnapshots(worktreeBefore, worktreeAfter);
+      const worktreeChanged = worktreeAfter.ok === false || compareWorktreeSnapshots(worktreeBefore, worktreeAfter);
 
       if (worktreeChanged) {
         return {
           content: [textBlock("审查过程中工作目录发生变化，已取消审查以避免不一致。请重新运行。")],
-          details: { status: "worktree-changed" },
+          details: { status: "worktree-changed", failureKind: "worktree-changed" },
         };
       }
 
       // ── 8. Aggregate findings ──
-      const aggregated = aggregateFindings(
-        chunkResults.map((cr) => ({
-          chunkId: cr.chunkId,
-          result: cr.result.ok
-            ? { ok: true as const, review: { status: cr.result.status as "passed" | "issues_found", summary: cr.result.summary, findings: cr.result.findings } }
-            : { ok: false as const, failure: cr.result.failure as any, error: cr.result.error || "Chunk failed", raw: cr.result.raw || "" },
-        })),
-      );
+      const aggregated = aggregateFindings(chunkResults);
+      const complete = aggregated.coverage === "complete" && skipped.length === 0;
+
+      if (aggregated.parsedChunks === 0) {
+        const failureKind = failures[0] || "provider-failed";
+        return formatReviewResponse(
+          failureResult(failureKind, totalDurationMs || Date.now() - reviewStartedAt, totalToolCalls),
+          ctx.model,
+          changes.length,
+          memoryStatus,
+        );
+      }
 
       const finalResult: SubagentResult = {
         taskId: `review-${Date.now()}`,
-        status: aggregated.findings.length === 0 ? "success" : "success",
+        status: "success",
         summary: aggregated.findings.length === 0
-          ? "未发现问题"
-          : `发现 ${aggregated.findings.length} 个问题`,
-        findings: aggregated.findings.map((f) => ({
-          severity: f.severity,
-          file: f.file,
-          line: f.line,
-          description: f.description,
+          ? (complete ? "未发现问题" : "审查不完整；已审查部分未发现问题")
+          : (complete
+              ? `发现 ${aggregated.findings.length} 个问题`
+              : `审查不完整；已发现 ${aggregated.findings.length} 个问题`),
+        findings: aggregated.findings.map(({ severity, file, line, description }) => ({
+          severity, file, line, description,
         })),
-        changedFiles: changes.map((c) => c.path),
-        durationMs: 0, // total duration computed from individual calls
-        toolCalls: 0,
-        coverage: aggregated.coverage,
+        changedFiles: [...new Set(changes.map((change) => change.path))],
+        durationMs: totalDurationMs || Date.now() - reviewStartedAt,
+        toolCalls: totalToolCalls,
+        coverage: complete ? "complete" : "partial",
         telemetry: {
           totalChunks: aggregated.totalChunks,
           parsedChunks: aggregated.parsedChunks,
           failedChunks: aggregated.failedChunks,
+          skippedFiles: skipped.length,
+          failureKinds: [...new Set(failures)],
           worktreeChanged,
         },
       };
 
       return formatReviewResponse(
-        { kind: aggregated.coverage === "complete" ? "success" : "partial", result: finalResult },
+        { kind: complete ? "success" : "partial", result: finalResult },
         ctx.model,
         changes.length,
         memoryStatus,
@@ -281,28 +308,48 @@ export function registerSubagentExtension(
 // Helpers for chunk result wrapping
 // ═══════════════════════════════════════════════════════════════
 
-function parseReviewOutput(text: string): {
-  ok: boolean;
-  status: string;
-  summary: string;
-  findings: any[];
-  failure?: string;
-  error?: string;
-  raw?: string;
+function reviewResultToParseResult(result: ReviewResultUnion): {
+  result: ParseSuccess | ParseFailure;
+  durationMs: number;
+  toolCalls: number;
 } {
-  if (!text.trim()) {
-    return { ok: false, status: "failed", summary: "", findings: [], failure: "parse-failed", error: "Empty output", raw: text };
-  }
-  try {
-    const p = JSON.parse(text);
+  if (result.kind === "success" || result.kind === "partial") {
+    const status = result.result.findings.length > 0 ? "issues_found" : "passed";
     return {
-      ok: true,
-      status: p.status || "passed",
-      summary: p.summary || "",
-      findings: Array.isArray(p.findings) ? p.findings : [],
+      result: {
+        ok: true,
+        review: { status, summary: result.result.summary, findings: result.result.findings },
+      },
+      durationMs: result.result.durationMs,
+      toolCalls: result.result.toolCalls,
     };
-  } catch {
-    return { ok: false, status: "failed", summary: "", findings: [], failure: "parse-failed", error: "Invalid JSON", raw: text };
+  }
+
+  const failure = result.kind === "no-changes" ? "provider-failed" : result.kind;
+  const raw = result.kind === "parse-failed" || result.kind === "schema-failed" ? result.raw : "";
+  const error = "error" in result ? result.error : result.kind;
+  return {
+    result: { ok: false, failure, error, raw },
+    durationMs: "durationMs" in result ? result.durationMs || 0 : 0,
+    toolCalls: "toolCalls" in result ? result.toolCalls || 0 : 0,
+  };
+}
+
+function failureResult(
+  failureKind: ReviewerFailureKind,
+  durationMs: number,
+  toolCalls: number,
+): ReviewResultUnion {
+  const metrics = { durationMs, toolCalls };
+  switch (failureKind) {
+    case "timeout": return { kind: "timeout", ...metrics };
+    case "aborted": return { kind: "aborted", ...metrics };
+    case "session-create-failed": return { kind: failureKind, error: "All review chunks failed", ...metrics };
+    case "parse-failed": return { kind: failureKind, error: "All review chunks failed to parse", raw: "", ...metrics };
+    case "schema-failed": return { kind: failureKind, error: "All review chunks failed schema validation", raw: "", ...metrics };
+    case "git-failed": return { kind: failureKind, error: "All review chunks failed", ...metrics };
+    case "worktree-changed": return { kind: failureKind, ...metrics };
+    default: return { kind: "provider-failed", error: `All review chunks failed (${failureKind})`, ...metrics };
   }
 }
 
@@ -334,13 +381,17 @@ function formatReviewResponse(
     case "session-create-failed":
       return {
         content: [textBlock(`创建审查 Session 失败：${(reviewResult as any).error || "未知错误"}`)],
-        details: { status: "session-create-failed" },
+        details: {
+          status: "session-create-failed",
+          failureKind: "session-create-failed",
+          ...failureMetrics(reviewResult),
+        },
       };
 
     case "provider-failed":
       return {
         content: [textBlock(`审查执行失败（Provider 错误）：${(reviewResult as any).error || "未知错误"}`)],
-        details: { status: "failed" },
+        details: { status: "failed", failureKind: "provider-failed", ...failureMetrics(reviewResult) },
       };
 
     case "parse-failed":
@@ -348,32 +399,38 @@ function formatReviewResponse(
       const { error } = reviewResult as any;
       return {
         content: [textBlock(`审查输出解析失败：${error}。审查代理未能返回有效结果。`)],
-        details: { status: "failed", error, raw: (reviewResult as any).raw },
+        details: {
+          status: "failed",
+          failureKind: kind,
+          error,
+          raw: (reviewResult as any).raw,
+          ...failureMetrics(reviewResult),
+        },
       };
     }
 
     case "timeout":
       return {
         content: [textBlock("Reviewer SubAgent 超时（120 秒）。")],
-        details: { status: "timeout" },
+        details: { status: "timeout", failureKind: "timeout", ...failureMetrics(reviewResult) },
       };
 
     case "aborted":
       return {
         content: [textBlock("审查被取消。")],
-        details: { status: "aborted" },
+        details: { status: "aborted", failureKind: "aborted" },
       };
 
     case "worktree-changed":
       return {
         content: [textBlock("审查过程中工作目录发生变化，已取消审查以避免不一致。请重新运行。")],
-        details: { status: "worktree-changed" },
+        details: { status: "worktree-changed", failureKind: "worktree-changed" },
       };
 
     case "success":
     case "partial": {
       const result = (reviewResult as any).result as SubagentResult;
-      return formatSuccessResponse(result, changeCount, memoryStatus);
+      return formatSuccessResponse(result, changeCount, memoryStatus, kind === "partial");
     }
 
     default:
@@ -384,13 +441,23 @@ function formatReviewResponse(
   }
 }
 
+function failureMetrics(reviewResult: unknown): { durationMs?: number; toolCalls?: number } {
+  if (!reviewResult || typeof reviewResult !== "object") return {};
+  const result = reviewResult as { durationMs?: number; toolCalls?: number };
+  return {
+    ...(result.durationMs !== undefined ? { durationMs: result.durationMs } : {}),
+    ...(result.toolCalls !== undefined ? { toolCalls: result.toolCalls } : {}),
+  };
+}
+
 function formatSuccessResponse(
   result: SubagentResult,
   changeCount?: number,
   memoryStatus?: string,
+  partial = false,
 ) {
   const findingsText = result.findings.length === 0
-    ? "未发现问题。"
+    ? (partial ? "已完成的审查部分未发现问题；不能据此断言全部变更无问题。" : "未发现问题。")
     : result.findings.map((f, i) =>
         `${i + 1}. **${f.severity}** ${f.file ? `\`${f.file}\`` : ""}${f.line ? `:${f.line}` : ""} — ${f.description}`
       ).join("\n");
@@ -416,7 +483,8 @@ function formatSuccessResponse(
 
   return {
     content: [textBlock([
-      `## Code Review — ${result.summary}`,
+      partial ? "## Code Review — 审查不完整" : `## Code Review — ${result.summary}`,
+      partial ? `> 警告：仅部分变更完成审查。${result.summary}` : "",
       "",
       meta,
       `**严重**：${severityCounts.high}　**中等**：${severityCounts.medium}　**轻微**：${severityCounts.low}`,
@@ -429,6 +497,8 @@ function formatSuccessResponse(
       findings: result.findings,
       coverage: result.coverage,
       telemetry: result.telemetry,
+      durationMs: result.durationMs,
+      toolCalls: result.toolCalls,
     },
   };
 }

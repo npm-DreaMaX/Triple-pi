@@ -101,9 +101,8 @@ export function registerMemoryExtension(
         scope?: string;
       };
 
-      // Normalize scope: undefined → "project", "project" → "project",
-      // "global" → "global", anything else → "invalid-scope"
-      const scope: string = rawScope === "global" ? "global" : rawScope === "project" ? "project" : "project";
+      // Preserve the submitted scope so invalid manual values fail closed.
+      const scope = rawScope ?? "project";
 
       // Run validateMemoryWrite — fail closed before confirm if secret/overflow
       const validated = validateMemoryWrite(
@@ -165,6 +164,11 @@ export function registerMemoryExtension(
           provenance: {
             source: "manual",
             sessionId: ctx.sessionManager.getSessionId(),
+            scopeDecision: {
+              requested: normalizedScope,
+              resolved: normalizedScope,
+              reason: "user-confirmed-manual",
+            },
           },
         });
         return {
@@ -345,14 +349,20 @@ export function registerMemoryExtension(
     working.scratchpad = working.scratchpad.slice(0, Math.floor(workingCharBudget * 0.6));
     working.recentDaily = working.recentDaily.slice(-Math.floor(workingCharBudget * 0.4));
 
-    // Build the prompt modifications
-    const result: { systemPrompt?: string; messages?: any[] } = {};
+    // Build the Pi hook contract. Persistent memory modifies this turn's
+    // system prompt; derived working state is returned as one hidden message.
+    const result: {
+      systemPrompt?: string;
+      message?: {
+        customType: string;
+        content: string;
+        display: boolean;
+        details: Record<string, unknown>;
+      };
+    } = {};
 
-    // Always include persistent memory prompt in system prompt
-    if (memory.prompt) {
+    if (memory.prompt && !event.systemPrompt.includes(memory.prompt)) {
       result.systemPrompt = [event.systemPrompt, memory.prompt].filter(Boolean).join("\n\n");
-    } else {
-      result.systemPrompt = event.systemPrompt;
     }
 
     // Inject Working State as a hidden custom/user message (not in systemPrompt).
@@ -372,27 +382,18 @@ export function registerMemoryExtension(
           ].join("\n")
         : "";
 
-      if (workingPrompt) {
-        // Filter out old working context messages to avoid accumulation
-        const existingMessages = (event as any).messages || [];
-        const filteredMessages = existingMessages.filter(
-          (msg: any) => !(msg.customType === WORKING_CONTEXT_TYPE),
-        );
-
-        result.messages = [
-          ...filteredMessages,
-          {
-            type: "custom",
-            customType: WORKING_CONTEXT_TYPE,
-            data: {
-              content: workingPrompt,
-              updatedAt: working.scratchpad ? new Date().toISOString() : undefined,
-              derived: true,
-              temporary: true,
-              untrusted: true,
-            },
+      if (workingPrompt && !(event.prompt ?? "").includes(workingPrompt)) {
+        result.message = {
+          customType: WORKING_CONTEXT_TYPE,
+          content: workingPrompt,
+          display: false,
+          details: {
+            derived: true,
+            temporary: true,
+            untrusted: true,
+            sourceHash: branchState?.sourceHash,
           },
-        ];
+        };
       }
     }
 
@@ -494,6 +495,7 @@ export function registerMemoryExtension(
           `Project: ${diagnostics.project.id}`,
           `Schema: v${diagnostics.schemaVersion}; root mode: ${diagnostics.permissions}`,
           `Long-term: ${diagnostics.longTermCount}; extraction manifests: ${diagnostics.extractionManifestCount}`,
+          `Extraction: ${diagnostics.extractionRunning ? "running" : "idle"}; pending: ${diagnostics.extractionPending ? "yes" : "no"}; failures: ${diagnostics.consecutiveExtractionFailures}; rollback failures: ${diagnostics.rollbackFailureCount}`,
           `Working: ${diagnostics.hasScratchpad ? "scratchpad" : "none"}; manifests: ${diagnostics.workingManifestCount}`,
         ].join("\n"),
         "info",

@@ -1,7 +1,20 @@
 #!/usr/bin/env bash
-# Triple-pi launcher — run from any directory.
-SCRIPT_DIR="$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+set -euo pipefail
+
+# Resolve this launcher without requiring GNU realpath (not installed by default
+# on every supported Unix platform). Handle both absolute and relative links.
+SOURCE=${BASH_SOURCE[0]}
+while [[ -L "$SOURCE" ]]; do
+  DIR=$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)
+  TARGET=$(readlink "$SOURCE")
+  if [[ "$TARGET" == /* ]]; then
+    SOURCE=$TARGET
+  else
+    SOURCE=$DIR/$TARGET
+  fi
+done
+SCRIPT_DIR=$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)
+REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 
 echo "Triple-pi — Persistent Memory & Project-aware Code Review"
 exec "$REPO_ROOT/pi-runtime/pi-test.sh" "$@"

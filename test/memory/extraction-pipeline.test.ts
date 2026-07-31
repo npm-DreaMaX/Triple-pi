@@ -30,6 +30,18 @@ describe("strict extraction pipeline", () => {
     expect(validateCandidates(raw(), source)).toHaveLength(1);
   });
 
+  it("preserves requested and resolved scope after policy downgrade", () => {
+    const globalSource = {
+      ...source,
+      messages: [{ ...source.messages[0], content: "Always use strict TypeScript." }, source.messages[1]],
+    };
+    const candidate = validateCandidates(raw({
+      scope: "global",
+      evidence: "Always use strict TypeScript.",
+    }), globalSource)[0];
+    expect(candidate).toMatchObject({ requestedScope: "global", resolvedScope: "project", scope: "project" });
+  });
+
   it("keeps same-title candidates for uniform review", () => {
     const first = JSON.parse(raw())[0];
     const second = { ...first, evidence: "Always use strict TypeScript in this project.", content: "A corrected interpretation." };

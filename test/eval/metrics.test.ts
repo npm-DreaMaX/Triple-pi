@@ -74,6 +74,50 @@ describe("exact eval metrics", () => {
     expect(metrics.failures).not.toEqual([]); // should have failures when TP demoted
   });
 
+  it("demotes every contaminated matched record but adds one forbidden FP", () => {
+    const testCase = {
+      id: "multiple-contaminated-matches",
+      description: "multiple matched records contain forbidden content",
+      cwd: "/eval/project",
+      user: "Remember alpha and beta.",
+      assistant: "Noted.",
+      expected: [
+        {
+          category: "rule" as const,
+          scope: "project" as const,
+          titleIncludes: ["alpha"],
+          contentIncludes: ["first"],
+          evidenceIncludes: "alpha",
+          sourceEntryId: "u1",
+        },
+        {
+          category: "rule" as const,
+          scope: "project" as const,
+          titleIncludes: ["beta"],
+          contentIncludes: ["second"],
+          evidenceIncludes: "beta",
+          sourceEntryId: "u1",
+        },
+      ],
+      forbidden: ["forbidden alpha", "forbidden beta"],
+    };
+    const contaminated = [
+      record({ id: "alpha", title: "Alpha", content: "First; forbidden alpha" }),
+      record({ id: "beta", title: "Beta", content: "Second; forbidden beta" }),
+    ];
+
+    const metrics = evaluateRecords(testCase, contaminated);
+
+    expect(metrics).toMatchObject({
+      truePositive: 0,
+      falseNegative: 2,
+      falsePositive: 1,
+      forbiddenFP: true,
+    });
+    expect(metrics.failures.filter((failure) =>
+      failure.startsWith("Matched record also contains forbidden content:"))).toHaveLength(2);
+  });
+
   it("noise case with false positive has noiseFPRejectionRate=false", () => {
     const noiseCase = EVAL_CASES.find((c) => c.id === "noise-only")!;
     const bad = record({ title: "Temporary", content: "Debugging session data" });

@@ -74,6 +74,11 @@ describe("memory extension", () => {
 
     expect(context.ui.confirm).toHaveBeenCalledOnce();
     expect(saved.details.saved).toBe(true);
+    expect((await repository.list(projectA))[0].provenance.scopeDecision).toEqual({
+      requested: "project",
+      resolved: "project",
+      reason: "user-confirmed-manual",
+    });
 
     const nextSession = createContext(projectA);
     const result = await beforeAgentStart({ systemPrompt: "Base prompt" }, nextSession);
@@ -122,21 +127,25 @@ describe("memory extension", () => {
     expect(await repository.list(projectA)).toEqual([]);
   });
 
-  it("rejects invalid categories and empty searches", async () => {
+  it("rejects invalid categories, manual scopes, and empty searches", async () => {
     const context = createContext(projectA);
     const invalid = await callTool("SaveMemory", {
       category: "../../escape",
       title: "Bad",
       content: "Bad",
     }, context);
+    const invalidScope = await callTool("SaveMemory", {
+      category: "fact", title: "Bad scope", content: "Must reject.", scope: "workspace",
+    }, context);
     const emptySearch = await callTool("SearchMemory", { keyword: "   " }, context);
 
     expect(invalid.details.reason).toBe("invalid-category");
+    expect(invalidScope.details.reason).toBe("invalid-scope");
     expect(emptySearch.details.count).toBe(0);
     expect(context.ui.confirm).not.toHaveBeenCalled();
   });
 
-  it("injects bounded working state separately from long-term memory", async () => {
+  it("returns a Pi CustomMessage contract for bounded working state", async () => {
     const source = {
       messages: [
         { entryId: "u1", role: "user" as const, content: "Continue checkout work.", timestamp: "2026-01-01" },
@@ -147,12 +156,20 @@ describe("memory extension", () => {
     await repository.saveWorkingState(projectA, buildWorkingStateUpdate(source, "session-working", new Date())!);
     await repository.markProjectActive(projectA);
 
-    const result = await beforeAgentStart({ systemPrompt: "Base" }, createContext(projectA));
-    // Working State is now injected as custom messages, not system prompt
-    const workingMsg = result?.messages?.find((m: any) => m?.customType === "triple-pi-working-context");
-    expect(workingMsg).toBeDefined();
-    const content = workingMsg?.data?.content || "";
-    expect(content).toContain("Continue checkout work.");
+    const result = await beforeAgentStart({ prompt: "next turn", systemPrompt: "Base" }, createContext(projectA));
+    expect(result.message).toMatchObject({
+      customType: "triple-pi-working-context",
+      display: false,
+      details: { derived: true, temporary: true, untrusted: true },
+    });
+    expect(result.message.content).toContain("Continue checkout work.");
+    expect(result.message).not.toHaveProperty("data");
+
+    const repeated = await beforeAgentStart({
+      prompt: result.message.content,
+      systemPrompt: result.systemPrompt ?? "Base",
+    }, createContext(projectA));
+    expect(repeated).toBeUndefined();
   });
 
   it("searches current project and global memory content", async () => {

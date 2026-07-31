@@ -68,6 +68,34 @@ describe("FilesystemMemoryRepository", () => {
     expect(updated.createdAt).toBe(first.createdAt);
     expect(updated.updatedAt).toBe("2026-01-02T00:00:00.000Z");
     expect((await repository.search("GraphQL", projectA))[0]?.record.content).toBe("Use GraphQL.");
+    const revisions = await repository.listRevisions(updated.id, projectA);
+    expect(revisions).toHaveLength(1);
+    expect(revisions[0].revisionId).toBe(updated.provenance.revision?.previousRevisionId);
+    expect(revisions[0].content).toBe("Use REST.");
+  });
+
+  it("builds a traversable revision chain across manual and batch replacements", async () => {
+    const first = await repository.save({
+      category: "decision", scope: "project", cwd: projectA,
+      title: "Revision chain", content: "Version one.",
+    });
+    const second = await repository.save({
+      category: "decision", scope: "project", cwd: projectA,
+      title: "Revision chain", content: "Version two.",
+    });
+    const [third] = await repository.saveExtractionBatch(projectA, "d".repeat(64), [{
+      category: "decision", scope: "project", title: "Revision chain", content: "Version three.",
+      replaceRecordId: first.id, provenance: { source: "extraction" },
+    }]);
+
+    expect(third.provenance.revision?.previousRevisionId).toBe(second.provenance.revision?.revisionId);
+    const previous = await repository.getRevision(first.id, third.provenance.revision!.previousRevisionId!, projectA);
+    expect(previous?.content).toBe("Version two.");
+    expect(previous?.provenance.revision?.previousRevisionId).toBe(first.provenance.revision?.revisionId);
+    expect((await repository.listRevisions(first.id, projectA)).map((revision) => revision.content)).toEqual([
+      "Version one.",
+      "Version two.",
+    ]);
   });
 
   it("rejects invalid runtime categories at the repository boundary", async () => {
@@ -166,6 +194,47 @@ describe("FilesystemMemoryRepository", () => {
       replaceRecordId: "../../escape",
       provenance: { source: "extraction" },
     }])).rejects.toThrow("Invalid replacement record ID");
+  });
+
+  it("rolls back every target and leaves no manifest after an injected write failure", async () => {
+    let writes = 0;
+    repository = new FilesystemMemoryRepository({
+      root: tempDir,
+      beforeWrite: (filepath) => {
+        if (!filepath.includes("MEMORY.md") && ++writes === 3) throw new Error("injected write failure");
+      },
+    });
+    const project = resolveProjectIdentity(projectA);
+
+    await expect(repository.saveExtractionBatch(projectA, "f".repeat(64), [{
+      category: "rule", scope: "project", title: "Atomic batch", content: "Must roll back.",
+      provenance: { source: "extraction" },
+    }], undefined, { key: 1 })).rejects.toThrow("injected write failure");
+
+    expect(await repository.list(projectA)).toEqual([]);
+    await expect(fs.access(path.join(tempDir, "signals", project.id, "reinforcement.json"))).rejects.toThrow();
+    await expect(fs.access(path.join(tempDir, "projects", project.id, "project.json"))).rejects.toThrow();
+    await expect(fs.access(path.join(tempDir, "extractions", project.id, `${"f".repeat(64)}.json`))).rejects.toThrow();
+  });
+
+  it("reports extraction attempts, successes, failures, and live scheduler state", async () => {
+    repository.updateExtractionDiagnostics({ running: true, pending: true, attempted: true });
+    let diagnostics = await repository.diagnose(projectA);
+    expect(diagnostics).toMatchObject({ extractionRunning: true, extractionPending: true });
+    expect(diagnostics.lastExtractionAttemptAt).toEqual(expect.any(String));
+
+    repository.updateExtractionDiagnostics({ running: false, pending: false, failureStage: "review", failureCode: "BAD_OUTPUT" });
+    diagnostics = await repository.diagnose(projectA);
+    expect(diagnostics).toMatchObject({
+      lastExtractionFailureStage: "review",
+      lastExtractionFailureCode: "BAD_OUTPUT",
+      consecutiveExtractionFailures: 1,
+    });
+
+    repository.updateExtractionDiagnostics({ succeeded: true });
+    diagnostics = await repository.diagnose(projectA);
+    expect(diagnostics.consecutiveExtractionFailures).toBe(0);
+    expect(diagnostics.lastExtractionSuccessAt).toEqual(expect.any(String));
   });
 
   it("increments reinforcement inside the repository lock", async () => {

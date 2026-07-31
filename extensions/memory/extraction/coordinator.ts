@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import type { Model } from "@earendil-works/pi-ai";
 import type { ModelRegistry, SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { FilesystemMemoryRepository } from "../repository.ts";
@@ -8,7 +8,6 @@ import {
   type MemoryScope,
   type ScopeDecision,
 } from "../domain.ts";
-import { resolveAutomaticScope } from "../validation.ts";
 import { extractCandidateJson } from "./provider.ts";
 import { redactSecrets, validateCandidates } from "./pipeline.ts";
 import { reviewCandidates } from "./review.ts";
@@ -68,19 +67,20 @@ function buildEvidence(
 }
 
 function buildScopeDecision(
-  candidateScope: MemoryScope,
-  evidenceText: string,
+  requestedScope: MemoryScope,
+  resolvedScope: MemoryScope,
+  evidence: MemoryEvidence,
 ): ScopeDecision {
-  const resolvedScope = resolveAutomaticScope(candidateScope, evidenceText);
-  const decided = resolvedScope === "global"
+  const reason = resolvedScope === "global"
     ? "explicit-cross-project-evidence"
-    : candidateScope === "global"
+    : requestedScope === "global"
       ? "missing-cross-project-evidence"
       : "default-project";
   return {
-    requested: candidateScope,
+    requested: requestedScope,
     resolved: resolvedScope,
-    reason: decided,
+    reason,
+    evidence,
   };
 }
 
@@ -120,7 +120,7 @@ export async function runExtraction(
   if (signal.aborted) return { savedCount: 0, status: "aborted" };
   const candidates = validateCandidates(raw, { ...source, messages: prepared.redactedMessages });
   const tReview = performance.now();
-  const reviewed = snapshot.reviewerEnabled !== false
+  const reviewedOutput = snapshot.reviewerEnabled !== false
     ? await reviewCandidates({
         model: snapshot.model,
         modelRegistry: snapshot.modelRegistry,
@@ -128,7 +128,14 @@ export async function runExtraction(
         source: { ...source, messages: prepared.redactedMessages },
         signal,
       })
-    : candidates.map((c) => ({ action: "keep" as const, ...c }));
+    : candidates;
+  // Keep compatibility with reviewers recorded before requested/resolved scope
+  // became explicit, while canonicalizing the shape at this boundary.
+  const reviewed = reviewedOutput.map((candidate) => ({
+    ...candidate,
+    requestedScope: candidate.requestedScope ?? candidate.scope,
+    resolvedScope: candidate.resolvedScope ?? candidate.scope,
+  }));
   const reviewLatencyMs = performance.now() - tReview;
   if (signal.aborted) return { savedCount: 0, status: "aborted" };
 
@@ -142,7 +149,7 @@ export async function runExtraction(
   const reservedTargets = new Set<string>();
   for (const candidate of reviewed) {
     const provisional = scoreCandidate(candidate, prepared.redactedMessages, 0);
-    const key = reinforcementKey(project.id, candidate.scope, provisional.fingerprint);
+    const key = reinforcementKey(project.id, candidate.resolvedScope, provisional.fingerprint);
     const signals = scoreCandidate(candidate, prepared.redactedMessages, reinforcement[key]?.count || 0);
     const available = existing.filter((record) => !reservedTargets.has(record.id));
     const plan = planConsolidation(candidate, signals, available);
@@ -161,22 +168,13 @@ export async function runExtraction(
     snapshot.cwd,
     source.sourceHash,
     persistencePlans.map(({ plan }) => {
-      // Build evidence array
-      const evidence: MemoryEvidence[] = [buildEvidence(plan.candidate.evidence, plan.candidate.sourceEntryId)];
-      // Build scope decision
-      const scopeDecision: ScopeDecision = buildScopeDecision(plan.candidate.scope, plan.candidate.evidence);
-      // Build revision pointer (not self-referencing — points to the previous revision in the chain)
-      const revision = plan.action === "replace" && plan.existing?.provenance?.revision
-        ? {
-            revisionId: randomUUID(),
-            previousRevisionId: plan.existing.provenance.revision.revisionId,
-          }
-        : undefined;
-      // For create actions, no revision chain (first revision is implicit)
-      // For replace with no existing revision chain, create first revision pointer
-      const firstRevision = plan.action === "replace" && !plan.existing?.provenance?.revision
-        ? { revisionId: randomUUID() }
-        : undefined;
+      const grounding = buildEvidence(plan.candidate.evidence, plan.candidate.sourceEntryId);
+      const evidence: MemoryEvidence[] = [grounding];
+      const scopeDecision: ScopeDecision = buildScopeDecision(
+        plan.candidate.requestedScope,
+        plan.candidate.resolvedScope,
+        grounding,
+      );
 
       const provenance: MemoryProvenance = {
         source: "extraction",
@@ -189,11 +187,10 @@ export async function runExtraction(
         correction: plan.signals.correction,
         evidence,
         scopeDecision,
-        revision: revision || firstRevision,
       };
       return {
         category: plan.candidate.category,
-        scope: plan.candidate.scope,
+        scope: plan.candidate.resolvedScope,
         title: plan.candidate.title,
         content: plan.candidate.content,
         replaceRecordId: plan.action === "replace" ? plan.existing?.id : undefined,

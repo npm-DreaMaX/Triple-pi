@@ -6,13 +6,25 @@ import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 const run = promisify(execFile);
+let root: string;
 let agentDir: string;
-beforeEach(async () => { agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "triple-pi-install-")); });
-afterEach(async () => fs.rm(agentDir, { recursive: true, force: true }));
+let binDir: string;
+beforeEach(async () => {
+  root = await fs.mkdtemp(path.join(os.tmpdir(), "triple-pi-install-"));
+  agentDir = path.join(root, "agent");
+  binDir = path.join(root, "bin");
+});
+afterEach(async () => fs.rm(root, { recursive: true, force: true }));
 
-async function install() {
+async function install(extraEnv: NodeJS.ProcessEnv = {}) {
   return run(process.execPath, [path.resolve("scripts/install-extension.mjs")], {
-    env: { ...process.env, PI_CODING_AGENT_DIR: agentDir },
+    env: {
+      ...process.env,
+      NODE_ENV: "test",
+      PI_CODING_AGENT_DIR: agentDir,
+      TRIPLE_PI_BIN_DIR: binDir,
+      ...extraEnv,
+    },
   });
 }
 
@@ -42,17 +54,58 @@ describe("extension installer", () => {
   });
 
   it("migrates legacy memory-only symlink to unified extension", async () => {
-    // Create legacy memory symlink pointing to our project
     const legacyMemory = path.join(agentDir, "extensions", "memory");
     await fs.mkdir(path.dirname(legacyMemory), { recursive: true });
     await fs.symlink(path.resolve("extensions/memory"), legacyMemory);
 
     await install();
 
-    // Legacy should be removed
     await expect(fs.lstat(legacyMemory)).rejects.toThrow("ENOENT");
-    // Unified should be installed
     const unifiedTarget = path.join(agentDir, "extensions", "triple-pi");
     expect((await fs.lstat(unifiedTarget)).isSymbolicLink()).toBe(true);
+  });
+
+  it("preserves an unrelated legacy memory symlink", async () => {
+    const unrelated = path.join(root, "unrelated-memory");
+    const legacyMemory = path.join(agentDir, "extensions", "memory");
+    await fs.mkdir(unrelated);
+    await fs.mkdir(path.dirname(legacyMemory), { recursive: true });
+    await fs.symlink(unrelated, legacyMemory);
+
+    await install();
+
+    expect(await fs.realpath(legacyMemory)).toBe(await fs.realpath(unrelated));
+  });
+
+  it("installs the launcher only in the injected bin directory", async () => {
+    await install();
+    const launcher = path.join(binDir, "trip");
+    expect((await fs.lstat(launcher)).isSymbolicLink()).toBe(true);
+    expect(await fs.realpath(launcher)).toBe(await fs.realpath(path.resolve("bin/trip")));
+  });
+
+  it.each([
+    ["unrelated symlink", async (dest: string) => {
+      const unrelated = path.join(root, "other-trip");
+      await fs.writeFile(unrelated, "#!/bin/sh\n");
+      await fs.symlink(unrelated, dest);
+    }],
+    ["regular file", async (dest: string) => fs.writeFile(dest, "user launcher\n")],
+  ])("refuses to overwrite an existing %s", async (_label, createDest) => {
+    const dest = path.join(binDir, "trip");
+    await fs.mkdir(binDir, { recursive: true });
+    await createDest(dest);
+
+    await expect(install()).rejects.toMatchObject({ code: 1 });
+  });
+
+  it("installs a Windows launcher that calls back to the checkout and is idempotent", async () => {
+    const env = { TRIPLE_PI_TEST_PLATFORM: "win32" };
+    await install(env);
+    const launcher = path.join(binDir, "trip.cmd");
+    expect((await fs.lstat(launcher)).isFile()).toBe(true);
+    const wrapper = await fs.readFile(launcher, "utf8");
+    expect(wrapper).toContain(path.resolve("bin/trip"));
+    await expect(install(env)).resolves.toMatchObject({ stdout: expect.stringContaining("already installed") });
   });
 });

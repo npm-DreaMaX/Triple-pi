@@ -5,6 +5,7 @@
 
 import { describe, expect, it } from "vitest";
 import { parseReviewerOutput, extractReviewSearchTerms, buildReviewChunks } from "../../extensions/subagent/review-core.ts";
+import { REVIEWER_TOOLS } from "../../extensions/subagent/manager.ts";
 import type { SubagentTask, ChangeFile } from "../../extensions/subagent/types.ts";
 
 // ═══════════════════════════════════════════════════════════════
@@ -289,14 +290,13 @@ describe("SubagentTask required fields", () => {
 
 describe("SubAgent — tool isolation constants", () => {
   it("reviewer tools are read-only", () => {
-    const reviewerTools = ["read", "grep", "find", "ls"] as const;
     const writeTools = ["edit", "write", "bash"];
 
-    for (const tool of reviewerTools) {
+    for (const tool of REVIEWER_TOOLS) {
       expect(writeTools).not.toContain(tool);
     }
     for (const tool of writeTools) {
-      expect(reviewerTools).not.toContain(tool);
+      expect(REVIEWER_TOOLS).not.toContain(tool);
     }
   });
 });

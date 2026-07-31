@@ -10,6 +10,7 @@
  */
 
 import * as fs from "node:fs/promises";
+import { homedir } from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { FilesystemMemoryRepository } from "../extensions/memory/repository.ts";
@@ -18,7 +19,7 @@ const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "
 const extensionSource = path.join(projectRoot, "extensions");
 const agentDir = process.env.PI_CODING_AGENT_DIR
   ? path.resolve(process.env.PI_CODING_AGENT_DIR)
-  : path.join(process.env.HOME || "", ".pi", "agent");
+  : path.join(homedir(), ".pi", "agent");
 const extensionDir = path.join(agentDir, "extensions");
 const unifiedLink = path.join(extensionDir, "triple-pi");
 const oldMemoryLink = path.join(extensionDir, "memory");

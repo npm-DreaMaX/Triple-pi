@@ -5,6 +5,8 @@ import { isCorrectionEvidence, scoreCandidate, semanticFingerprint } from "../..
 
 const candidate = {
   category: "rule" as const,
+  requestedScope: "project" as const,
+  resolvedScope: "project" as const,
   scope: "project" as const,
   title: "API response format",
   content: "Use the envelope data/error format.",

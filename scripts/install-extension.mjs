@@ -6,15 +6,31 @@
  */
 
 import * as fs from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, platform as hostPlatform } from "node:os";
 import * as path from "node:path";
-import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const homeDir = homedir();
 const agentDir = process.env.PI_CODING_AGENT_DIR
   ? path.resolve(process.env.PI_CODING_AGENT_DIR)
-  : path.join(homedir(), ".pi", "agent");
+  : path.join(homeDir, ".pi", "agent");
+const installPlatform = process.env.NODE_ENV === "test" && process.env.TRIPLE_PI_TEST_PLATFORM
+  ? process.env.TRIPLE_PI_TEST_PLATFORM
+  : hostPlatform();
+
+async function sameRealpath(left, right) {
+  try {
+    return await fs.realpath(left) === await fs.realpath(right);
+  } catch {
+    return false;
+  }
+}
+
+function refuseOverwrite(target) {
+  console.error(`[triple-pi] Refusing to overwrite unowned launcher: ${target}`);
+  process.exitCode = 1;
+}
 
 // ═══════════════════════════════════════════════════════════
 // 1. Install extension
@@ -24,10 +40,12 @@ const extSource = path.join(projectRoot, "extensions");
 const extTarget = path.join(agentDir, "extensions", "triple-pi");
 const oldTarget = path.join(agentDir, "extensions", "memory");
 
-// Clean up old per-extension symlink
+// Clean up only the legacy link owned by this checkout. Unrelated links are user data.
 try {
   const oldStat = await fs.lstat(oldTarget);
-  if (oldStat.isSymbolicLink()) {
+  const legacySources = [path.join(extSource, "memory"), extSource];
+  if (oldStat.isSymbolicLink()
+    && (await Promise.all(legacySources.map((source) => sameRealpath(oldTarget, source)))).some(Boolean)) {
     await fs.unlink(oldTarget);
     console.log(`[triple-pi] Removed old symlink: ${oldTarget}`);
   }
@@ -69,48 +87,73 @@ if (extNeedsInstall) {
 // 2. Install global launcher (trip)
 // ═══════════════════════════════════════════════════════════
 
+const windows = installPlatform === "win32";
 const launcherSource = path.join(projectRoot, "bin", "trip");
-const pathCandidates = [
-  path.join(homedir(), ".local", "bin"),
-  path.join(homedir(), "bin"),
-];
+const explicitBinDir = process.env.TRIPLE_PI_BIN_DIR;
+const pathCandidates = explicitBinDir
+  ? [path.resolve(explicitBinDir)]
+  : windows
+    ? [path.join(homeDir, "bin")]
+    : [path.join(homeDir, ".local", "bin"), path.join(homeDir, "bin")];
 
-let linked = false;
+let installed = false;
 for (const binDir of pathCandidates) {
-  const dest = path.join(binDir, "trip");
+  const dest = path.join(binDir, windows ? "trip.cmd" : "trip");
   try {
     await fs.mkdir(binDir, { recursive: true, mode: 0o755 });
 
-    // Check existing
-    let needsLink = true;
     try {
-      const s = await fs.lstat(dest);
-      if (s.isSymbolicLink()) {
-        try {
-          if (await fs.realpath(dest) === launcherSource) {
-            console.log(`[triple-pi] Launcher already linked: ${dest}`);
-            needsLink = false;
-          }
-        } catch {}
+      const stat = await fs.lstat(dest);
+      if (windows && stat.isFile()) {
+        // The installed wrapper calls the checkout launcher at the absolute path.
+        // If the wrapper already contains the current projectRoot, it is installed.
+        const current = await fs.readFile(dest, "utf8");
+        if (current.includes(launcherSource)) {
+          console.log(`[triple-pi] Launcher already installed: ${dest}`);
+          installed = true;
+          break;
+        }
+      } else if (!windows && stat.isSymbolicLink() && await sameRealpath(dest, launcherSource)) {
+        console.log(`[triple-pi] Launcher already linked: ${dest}`);
+        installed = true;
+        break;
       }
-      if (needsLink) await fs.unlink(dest);
+
+      refuseOverwrite(dest);
+      break;
     } catch (e) {
-      if (e.code !== "ENOENT") { needsLink = false; }
+      if (e.code !== "ENOENT") throw e;
     }
 
-    if (needsLink) {
+    if (windows) {
+      // Generate a self-contained .cmd wrapper that does NOT depend on its own
+      // location. Copying trip.bat would break because it resolves REPO_ROOT via
+      // %~dp0 relative to the installed location, not the checkout.
+      const wrapper = [
+        "@echo off",
+        `call "${launcherSource}" %*`,
+        "exit /b %ERRORLEVEL%",
+      ].join("\r\n") + "\r\n";
+      await fs.writeFile(dest, wrapper, { flag: "wx", mode: 0o755 });
+      console.log(`[triple-pi] Installed Windows launcher: ${dest}`);
+    } else {
       await fs.symlink(launcherSource, dest);
       console.log(`[triple-pi] Linked launcher: ${dest}`);
     }
-    linked = true;
+    installed = true;
     break;
   } catch (e) {
-    // Permission denied, try next candidate
+    // Permission denied, try the next default candidate. An explicit target is final.
     if (e.code !== "EACCES" && e.code !== "EPERM") throw e;
+    if (explicitBinDir) throw e;
   }
 }
 
-if (!linked) {
-  console.log(`[triple-pi] Add alias manually:`);
-  console.log(`  echo "alias trip='${launcherSource}'" >> ~/.zshrc && source ~/.zshrc`);
+if (!installed && process.exitCode !== 1) {
+  process.exitCode = 1;
+  if (windows) {
+    console.error(`[triple-pi] Launcher was not installed. Run ${launcherSource} directly.`);
+  } else {
+    console.error(`[triple-pi] Launcher was not installed. Run ${launcherSource} directly.`);
+  }
 }

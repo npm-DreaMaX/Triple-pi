@@ -14,6 +14,7 @@
 
 import { describe, expect, it, vi } from "vitest";
 import { extractReviewSearchTerms, buildReviewChunks, parseReviewerOutput } from "../../extensions/subagent/review-core.ts";
+import { REVIEWER_TOOLS } from "../../extensions/subagent/manager.ts";
 import type { ChangeFile } from "../../extensions/subagent/types.ts";
 
 // ═══════════════════════════════════════════════════════════════
@@ -21,7 +22,6 @@ import type { ChangeFile } from "../../extensions/subagent/types.ts";
 // ═══════════════════════════════════════════════════════════════
 
 describe("tool-isolation", () => {
-  const REVIEWER_TOOLS = ["read", "grep", "find", "ls"];
   const FORBIDDEN_TOOLS = ["edit", "write", "bash"];
 
   it("reviewer tools do not include any write tools", () => {
