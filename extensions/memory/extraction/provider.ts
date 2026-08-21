@@ -11,6 +11,7 @@ Return ONLY a JSON array. Each item must have exactly:
 - evidence: an exact verbatim substring from one user message
 - sourceEntryId: the entry ID of that user message
 - scope: project | global
+- keywords: array of 0-5 short retrieval terms (≤60 chars each) covering aliases, acronyms and synonyms someone would search with — e.g. ["PyG", "GNN", "图神经网络"] for "PyTorch Geometric", or ["鉴权", "auth", "JWT"] for "使用JWT认证". Omit the key when nothing beyond the title itself applies; never include secrets.
 
 Rules:
 - Extract only facts explicitly supported by USER text. Assistant statements are context, never evidence.

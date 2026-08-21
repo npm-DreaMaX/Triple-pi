@@ -11,6 +11,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import type { FilesystemMemoryRepository } from "../memory/repository.ts";
+import { tokenize } from "../memory/extraction/tokenize.ts";
 import type { ChangeFile, ReviewChunk, ReviewCoverage, ReviewFinding, ReviewInput, ReviewerFailureKind, ReviewFindingSeverity } from "./types.ts";
 
 // ═══════════════════════════════════════════════════════════════
@@ -29,6 +30,20 @@ const STOP_WORDS = new Set([
   "one", "two", "three", "first", "last", "next", "only", "same",
   "very", "just", "still", "already", "always", "never", "often",
   "usually", "thus", "well", "here", "there", "how", "why", "let",
+]);
+
+// S4：代码停用词——语言内建类型/关键字。Tier 3 优先级最高，若不滤掉，
+// "string/any/object" 之类内建名会挤占前 15 个检索词，淹没真正的领域词。
+const CODE_STOP_WORDS = new Set([
+  "any", "string", "number", "boolean", "bool", "void", "never", "unknown",
+  "undefined", "null", "true", "false", "object", "symbol", "bigint", "date",
+  "int", "float", "double", "char", "byte", "long", "short", "uint", "u8", "u16",
+  "u32", "u64", "i8", "i16", "i32", "i64", "f32", "f64", "usize", "isize", "str",
+  "vec", "map", "set", "array", "tuple", "promise", "future", "error", "exception",
+  "function", "interface", "class", "enum", "type", "const", "let", "var", "return",
+  "new", "this", "self", "super", "default", "public", "private", "protected",
+  "static", "async", "await", "import", "export", "module", "extends", "implements",
+  "readonly", "json", "math", "window", "document", "console", "require",
 ]);
 
 // ═══════════════════════════════════════════════════════════════
@@ -207,11 +222,12 @@ export function extractReviewSearchTerms(task: string, changes: ChangeFile[]): s
     const scanText = change.diff || change.content || "";
     if (!scanText) continue;
 
-    // Tier 3: Type/import names after : and < (highest priority — catches `any`, custom types, etc.)
+    // Tier 3: Type/import names after : and < (highest priority — catches custom types).
+    // S4：滤掉内建类型名——"any/string/object" 挤占前 15 词会把领域词淹没。
     const typeMatches = scanText.matchAll(/[:<]\s*([A-Z][a-zA-Z0-9]*|[a-z]{2,}[a-zA-Z0-9]*)\b/g);
     for (const tm of typeMatches) {
       const clean = tm[1].toLowerCase();
-      if (clean.length > 2 && !STOP_WORDS.has(clean)) {
+      if (clean.length > 2 && !STOP_WORDS.has(clean) && !CODE_STOP_WORDS.has(clean)) {
         typeTerms.add(clean);
       }
     }
@@ -225,11 +241,19 @@ export function extractReviewSearchTerms(task: string, changes: ChangeFile[]): s
       }
     }
 
-    // Tier 5: All significant content words (fallback)
+    // Tier 5: All significant content words (fallback). S4：同样滤内建类型名。
     for (const raw of scanText.split(/[\s,.;:!?()\[\]{}"'`<>+\-*/=|&^%$#@!~\\\n\r\t]+/)) {
       const clean = raw.toLowerCase();
-      if (clean.length > 2 && !STOP_WORDS.has(clean) && /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(clean)) {
+      if (clean.length > 2 && !STOP_WORDS.has(clean) && !CODE_STOP_WORDS.has(clean) && /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(clean)) {
         contentTerms.add(clean);
+      }
+    }
+    // S1 修复：CJK bigram 补充 —— 原正则只收 ASCII identifier，整段中文内容
+    //（注释/字符串）产出零检索词，导致纯中文代码 review 时记忆召回≈0。
+    // 与 M1 共用 tokenize.ts，口径一致。ASCII 词已被上面覆盖，这里只收 CJK bigram。
+    for (const tok of tokenize(scanText)) {
+      if (tok.length > 1 && !STOP_WORDS.has(tok) && !/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(tok)) {
+        contentTerms.add(tok);
       }
     }
   }
@@ -286,32 +310,18 @@ export async function searchRelevantMemories(
 ): Promise<SearchMemoriesResult> {
   if (terms.length === 0) return { hits: [] };
 
-  const byId = new Map<string, { record: any; hitTerms: string[]; titleHit: boolean }>();
-
-  for (const term of terms) {
-    try {
-      const results = await repository.search(term, cwd, { max: 3 });
-      for (const r of results) {
-        const existing = byId.get(r.record.id);
-        if (existing) {
-          existing.hitTerms.push(term);
-          if (r.record.title.toLocaleLowerCase().includes(term)) {
-            existing.titleHit = true;
-          }
-        } else {
-          byId.set(r.record.id, {
-            record: r.record,
-            hitTerms: [term],
-            titleHit: r.record.title.toLocaleLowerCase().includes(term),
-          });
-        }
-      }
-    } catch {
-      // Individual term search failure is non-fatal
-    }
+  // 2d S2：N+1 改为单扫。旧实现每个词一次 repository.search（每词截断 max:3），
+  // 一次 listUnlocked × N；现一次 searchByTerms 单扫 + 每条记录算命中词集合。
+  // 每词 max:3 截断随单扫移除——排序 + maxCount 兜底，低优先级词命中的记录不再被漏掉。
+  let matches: { record: any; hitTerms: string[]; titleHit: boolean }[];
+  try {
+    matches = await repository.searchByTerms(terms, cwd, { includeProject: true });
+  } catch {
+    // Single-scan failure is non-fatal — degrade to an empty result set.
+    matches = [];
   }
 
-  const entries = [...byId.values()];
+  const entries = matches;
 
   // Deterministic ranking
   entries.sort((a, b) => {

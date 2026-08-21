@@ -81,6 +81,10 @@ export interface MemoryRecord {
   createdAt: string;
   updatedAt: string;
   provenance: MemoryProvenance;
+  /** 3a M3: retrieval keywords (aliases/synonyms/acronyms), e.g. "PyG" for PyTorch Geometric.
+   *  Optional for backward compat with pre-keywords records. Indexed into search matching
+   *  with top weight; extraction emits them, manual saves may provide them. */
+  keywords?: string[];
 }
 
 // ── V1 compatibility (for reading old records) ────────────────────

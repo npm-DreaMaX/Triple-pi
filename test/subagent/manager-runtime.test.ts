@@ -58,6 +58,12 @@ describe("SubAgentManager runtime wiring", () => {
     expect(sdk.createAgentSession).toHaveBeenCalledWith(expect.objectContaining({
       tools: [...REVIEWER_TOOLS],
     }));
+    // S3：成功路径 per-manager 遥测 parsedChunks 应为 1（此前硬编码 0，与
+    // "一次 manager 调用完整审查一个 chunk" 的注释相悖）。
+    if (result.kind === "success") {
+      expect(result.result.telemetry?.parsedChunks).toBe(1);
+      expect(result.result.telemetry?.failedChunks).toBe(0);
+    }
   });
 
   it("counts every tool_use block, not assistant messages containing tools", async () => {

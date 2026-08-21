@@ -19,18 +19,32 @@ import {
 import { resolveProjectIdentity, type ProjectIdentity } from "./project-identity.ts";
 import {
   DAILY_MAX_CHARS,
+  MAX_SAMEDAY_ENTRIES,
+  PRUNE_DAILY_DAYS,
+  PRUNE_EXTRACTION_DAYS,
+  PRUNE_MAX_FILES,
+  PRUNE_REVISION_KEEP,
+  PRUNE_WORKING_DAYS,
   SCRATCHPAD_MAX_CHARS,
   parseWorkingLatest,
+  parseWorkingStateUpdate,
   renderDailyEntry,
   renderScratchpad,
+  serializeWorkingLatestIndex,
+  parseWorkingLatestIndex,
+  WORKING_INDEX_SCHEMA_VERSION,
+  type WorkingLatestIndex,
   type WorkingStateUpdate,
 } from "./working-state.ts";
-import { containsSecret, describeRejection, validateMemoryWrite } from "./validation.ts";
+import { containsSecret, describeRejection, validateKeywords, validateMemoryWrite } from "./validation.ts";
+import { tokenize } from "./extraction/tokenize.ts";
 
 const RECORD_START = "<!-- triple-pi-memory";
 const RECORD_END = "-->";
 const DEFAULT_PROMPT_ENTRY_LIMIT = 50;
 const DEFAULT_PROMPT_CHAR_LIMIT = 12_000;
+/** 3c M5：searchWorkingState 补扫的历史 daily 天数（不含最新一天）。 */
+const WORKING_SEARCH_DAILY_WINDOW = 7;
 
 export interface MemoryRepositoryOptions {
   root?: string;
@@ -47,6 +61,8 @@ export interface SaveMemoryInput {
   content: string;
   provenance?: MemoryProvenance;
   replaceRecordId?: string;
+  /** 3a M3: optional retrieval keywords (aliases/synonyms/acronyms). */
+  keywords?: string[];
 }
 
 export interface MemoryPrompt {
@@ -118,6 +134,8 @@ export interface SearchMemoryOptions {
   max?: number;
   includeArchived?: boolean;
   includeProject?: boolean;
+  /** 3d M6: filter to one category. Invalid values are ignored (no filter). */
+  category?: string;
 }
 
 export interface ListMemoryOptions {
@@ -238,11 +256,14 @@ function parseRecord(raw: string, filepath: string, diagnostics?: { corruptRecor
   }
 
   // V2+ record — return as-is
+  // 3a M3：宽容归一。非法/缺失的 keywords 不拒记录，只丢弃字段。
+  const keywords = validateKeywords(metadata["keywords"]);
   return {
     ...(metadata as Omit<MemoryRecord, "content" | "title">),
     schemaVersion: MEMORY_RECORD_SCHEMA_VERSION as 2,
     title,
     content,
+    ...(keywords ? { keywords } : {}),
   };
 }
 
@@ -268,6 +289,19 @@ export class FilesystemMemoryRepository {
   private lastExtractionFailureCode?: string;
   private consecutiveExtractionFailures = 0;
   private rollbackFailureCount = 0;
+
+  // 2b P1 记录缓存：把 listBase 的 O(N) 目录遍历 + N 次 readFile/parseRecord
+  // 变成进程内命中即返。parseRecord 是纯函数、确定性，无 TTL 需求；now() 不在
+  // 读路径上 → 过期向量只有「记录文件被改写」。进程内写路径直接删片；跨进程写
+  // 由 .cache-stamp 写令牌覆盖（mtime 在 WSL2/NFS 不可靠，不用时间判过期）。
+  // 详见 docs/technical/14-audit-memory-retrieval-and-reviewer.md §8 (2b)。
+  private readonly recordCache = new Map<string, { records: MemoryRecord[]; stampAtLoad: string }>();
+  private cacheStampSeq = 0;
+  /** 写放大小修：每次 save 全量重建 MEMORY.md 是 O(N) 写放大（1k 条 169ms）。
+   *  MEMORY.md 是派生便利索引（无生产代码读取——已核实），改为脏标记 + 延迟重建：
+   *  写路径只标记，session_start/memory-status/显式 rebuildIndex 时刷新。 */
+  private readonly pendingIndexRebuild = new Set<string>();
+  private static readonly CACHE_STAMP_NAME = ".cache-stamp";
 
   constructor(options: MemoryRepositoryOptions = {}) {
     this.root = path.resolve(options.root || defaultRoot());
@@ -304,7 +338,7 @@ export class FilesystemMemoryRepository {
   async save(input: SaveMemoryInput): Promise<MemoryRecord> {
     // Validate via shared validator
     const validated = validateMemoryWrite(
-      { category: input.category, title: input.title, content: input.content, scope: input.scope },
+      { category: input.category, title: input.title, content: input.content, scope: input.scope, keywords: input.keywords },
       { source: "manual" },
     );
     if ("kind" in validated) {
@@ -369,18 +403,17 @@ export class FilesystemMemoryRepository {
             previousRevisionId,
           },
         },
+        ...(validated.keywords ? { keywords: validated.keywords } : {}),
       };
 
       await this.atomicWrite(filepath, serializeRecord(record));
       if (input.scope === "project") {
         await this.writeActiveMetadataUnlocked(project);
       }
-      try {
-        await this.rebuildIndexUnlocked(input.scope, project);
-      } catch {
-        // MEMORY.md is a derived convenience index. The authoritative entry
-        // remains readable and a later rebuild can repair the index.
-      }
+      // MEMORY.md is a derived convenience index (no production reader) — mark
+      // dirty instead of rebuilding per save (O(N) write amplification).
+      this.pendingIndexRebuild.add(this.basePath(input.scope, project.id));
+      await this.invalidateCacheSlicesUnlocked(input.scope === "global" ? ["global"] : [`project:${project.id}`]);
       return record;
     });
   }
@@ -394,16 +427,18 @@ export class FilesystemMemoryRepository {
       const isNew = !(await exists(manifest));
       if (isNew) await this.atomicWrite(manifest, `${JSON.stringify(update, null, 2)}\n`);
 
+      // 2a P3: replaced the O(M) readdir+parse-all scan with an O(1) index read +
+      // increment-merge. The manifest above is written before this read so a rebuild
+      // fallback (missing/corrupt/count-mismatch index) always counts it. The index
+      // preserves the legacy semantics: latestUpdate = max(updatedAt) across all
+      // manifests; sameDay = entries whose date === incoming date.
       const manifestsDir = path.dirname(manifest);
-      const updates: WorkingStateUpdate[] = [];
-      for (const filename of await fs.readdir(manifestsDir)) {
-        if (!filename.endsWith(".json")) continue;
-        try {
-          updates.push(JSON.parse(await fs.readFile(path.join(manifestsDir, filename), "utf8")) as WorkingStateUpdate);
-        } catch {}
-      }
-      updates.sort((left, right) => left.updatedAt.localeCompare(right.updatedAt));
-      const latestUpdate = updates.at(-1) || update;
+      const index = await this.loadLatestIndexUnlocked(project.id, manifestsDir, isNew ? 1 : 0);
+      const merged = await this.mergeLatestIndexUnlocked(index, update, manifestsDir, project.id);
+      await this.writeLatestIndexUnlocked(project.id, merged);
+      const latestUpdate = merged.latestUpdate;
+      const sameDay = merged.sameDayEntries;
+
       const sessionKey = createHash("sha256").update(update.sessionId).digest("hex").slice(0, 24);
       const latestSessionKey = createHash("sha256").update(latestUpdate.sessionId).digest("hex").slice(0, 24);
       await this.atomicWrite(
@@ -415,7 +450,6 @@ export class FilesystemMemoryRepository {
         `${JSON.stringify({ sessionKey: latestSessionKey, update: latestUpdate }, null, 2)}\n`,
       );
 
-      const sameDay = updates.filter((item) => item.date === update.date);
       let dailyContent = `# Daily · ${update.date}\n\n${sameDay.map(renderDailyEntry).join("\n")}`;
       if (dailyContent.length > DAILY_MAX_CHARS) {
         dailyContent = `# Daily · ${update.date}\n\n${dailyContent.slice(dailyContent.length - DAILY_MAX_CHARS + 24)}`;
@@ -574,13 +608,35 @@ export class FilesystemMemoryRepository {
     };
   }
 
-  async searchWorkingState(keyword: string, cwd: string): Promise<{ source: "scratchpad" | "daily"; content: string }[]> {
+  async searchWorkingState(keyword: string, cwd: string): Promise<{ source: "scratchpad" | "daily"; content: string; date: string }[]> {
     const query = keyword.trim().toLocaleLowerCase();
     if (!query) return [];
     const state = await this.loadWorkingState(cwd);
-    const results: { source: "scratchpad" | "daily"; content: string }[] = [];
-    if (state.scratchpad.toLocaleLowerCase().includes(query)) results.push({ source: "scratchpad", content: state.scratchpad });
-    if (state.recentDaily.toLocaleLowerCase().includes(query)) results.push({ source: "daily", content: state.recentDaily });
+    const results: { source: "scratchpad" | "daily"; content: string; date: string }[] = [];
+    // 3c M5：结果带日期标注（审计 §3.3-M5 验收要求）。
+    if (state.scratchpad.toLocaleLowerCase().includes(query)) {
+      results.push({ source: "scratchpad", content: state.scratchpad, date: state.scratchpad.match(/Updated: (\d{4}-\d{2}-\d{2})/)?.[1] ?? "" });
+    }
+    if (state.recentDaily.toLocaleLowerCase().includes(query)) {
+      results.push({ source: "daily", content: state.recentDaily, date: state.recentDaily.match(/^# Daily · (\d{4}-\d{2}-\d{2})/m)?.[1] ?? "" });
+    }
+
+    // 3c M5：多日检索窗口。loadWorkingState 只带最新一天 daily——两天前的
+    // 工作状态搜不到。补扫最近 N 天（不含已检查的最新一天），有界（N 个文件、每个 ≤64KB）。
+    const project = resolveProjectIdentity(cwd);
+    const dailyDir = path.join(this.basePath("project", project.id), "daily");
+    if (await exists(dailyDir)) {
+      const files = (await fs.readdir(dailyDir))
+        .filter((file) => /^\d{4}-\d{2}-\d{2}\.md$/.test(file))
+        .sort()
+        .reverse();
+      for (const file of files.slice(1, 1 + WORKING_SEARCH_DAILY_WINDOW)) {
+        const content = await fs.readFile(path.join(dailyDir, file), "utf8");
+        if (content.toLocaleLowerCase().includes(query)) {
+          results.push({ source: "daily", content, date: file.slice(0, 10) });
+        }
+      }
+    }
     return results;
   }
 
@@ -627,6 +683,7 @@ export class FilesystemMemoryRepository {
         const title = normalizeTitle(input.title);
         const content = input.content.trim();
         if (!isMemoryCategory(input.category) || !title || !content) throw new Error("Invalid extraction entry");
+        if (validateKeywords(input.keywords) === null) throw new Error("Invalid extraction entry keywords");
         const projectId = input.scope === "global" ? "global" : project.id;
         let id = recordId(input.scope, projectId, input.category, title);
         if (input.replaceRecordId) {
@@ -689,6 +746,7 @@ export class FilesystemMemoryRepository {
               previousRevisionId,
             },
           },
+          ...(input.keywords ? { keywords: input.keywords } : {}),
         };
         staged.push({ filepath, record, revisionContent: undefined });
       }
@@ -801,9 +859,13 @@ export class FilesystemMemoryRepository {
         }
         throw error;
       }
-      for (const scope of new Set(entries.map((entry) => entry.scope))) {
-        try { await this.rebuildIndexUnlocked(scope, project); } catch {}
+      const touchedScopes = new Set(entries.map((entry) => entry.scope));
+      for (const scope of touchedScopes) {
+        this.pendingIndexRebuild.add(this.basePath(scope, project.id));
       }
+      await this.invalidateCacheSlicesUnlocked(
+        [...touchedScopes].map((scope) => (scope === "global" ? "global" : `project:${project.id}`)),
+      );
       return staged.filter((s) => s.revisionContent === undefined).map((item) => item.record);
     });
   }
@@ -830,6 +892,11 @@ export class FilesystemMemoryRepository {
     if (!query) return [];
 
     const normalized = typeof options === "number" ? { max: options } : options;
+    // 3d M6：逗号分隔多值（审计 §3.3-M6）；非法值忽略、空集视为无过滤，不抛错。
+    const parsedCategories = normalized.category
+      ? (normalized.category.split(",").map((c) => c.trim()).filter((c) => isMemoryCategory(c)) as MemoryCategory[])
+      : [];
+    const categoryFilter = parsedCategories.length > 0 ? new Set(parsedCategories) : undefined;
     const project = resolveProjectIdentity(cwd);
     const archivedBase = this.archivedProjectPath(project.id);
     const archivedBefore = await exists(archivedBase);
@@ -848,9 +915,65 @@ export class FilesystemMemoryRepository {
         this.listUnlocked(project, { includeProject: normalized.includeProject }),
         retryArchivedVisible ? this.listBase(archivedBase) : Promise.resolve([]),
       ]);
-      return this.formatSearchResults(query, [...retryGlobal, ...retryArchived], normalized.max, new Set(retryArchived.map((r) => r.id)));
+      return this.formatSearchResults(query, [...retryGlobal, ...retryArchived], normalized.max, new Set(retryArchived.map((r) => r.id)), categoryFilter);
     }
-    return this.formatSearchResults(query, allRecords, normalized.max, new Set(archivedRecords.map((r) => r.id)));
+    return this.formatSearchResults(query, allRecords, normalized.max, new Set(archivedRecords.map((r) => r.id)), categoryFilter);
+  }
+
+  /**
+   * Multi-term single-scan search (2d S2): replaces the N+1 pattern where callers
+   * looped `search(term)` per term — each loop re-ran listUnlocked + filtering.
+   * One listUnlocked (record-cache backed, O(1) after warm) + one per-record pass
+   * computing which terms hit. Caller owns the ranking.
+   */
+  async searchByTerms(
+    terms: string[],
+    cwd: string,
+    options: { includeArchived?: boolean; includeProject?: boolean } = {},
+  ): Promise<{ record: MemoryRecord; hitTerms: string[]; titleHit: boolean }[]> {
+    const normalizedTerms = [...new Set(terms.map((t) => t.trim().toLocaleLowerCase()).filter((t) => t.length > 0))];
+    if (normalizedTerms.length === 0) return [];
+
+    const project = resolveProjectIdentity(cwd);
+    const archivedBase = this.archivedProjectPath(project.id);
+    const archivedBefore = await exists(archivedBase);
+    const archivedVisible = options.includeArchived === true && archivedBefore;
+    const [globalAndProject, archived] = await Promise.all([
+      this.listUnlocked(project, { includeProject: options.includeProject }),
+      archivedVisible ? this.listBase(archivedBase) : Promise.resolve([]),
+    ]);
+    if (archivedBefore !== await exists(archivedBase)) {
+      // Archive position changed during the read — retry once.
+      const retryArchivedVisible = options.includeArchived === true && await exists(archivedBase);
+      const [retryGlobal, retryArchived] = await Promise.all([
+        this.listUnlocked(project, { includeProject: options.includeProject }),
+        retryArchivedVisible ? this.listBase(archivedBase) : Promise.resolve([]),
+      ]);
+      return this.matchByTerms(normalizedTerms, [...retryGlobal, ...retryArchived]);
+    }
+    return this.matchByTerms(normalizedTerms, [...globalAndProject, ...archived]);
+  }
+
+  private matchByTerms(
+    normalizedTerms: string[],
+    records: MemoryRecord[],
+  ): { record: MemoryRecord; hitTerms: string[]; titleHit: boolean }[] {
+    const results: { record: MemoryRecord; hitTerms: string[]; titleHit: boolean }[] = [];
+    for (const record of records) {
+      const title = record.title.toLocaleLowerCase();
+      const content = record.content.toLocaleLowerCase();
+      let titleHit = false;
+      const hitTerms: string[] = [];
+      for (const term of normalizedTerms) {
+        const inTitle = title.includes(term);
+        if (inTitle || content.includes(term)) {
+          hitTerms.push(term);
+          if (inTitle) titleHit = true;
+        }
+      }
+      if (hitTerms.length > 0) results.push({ record, hitTerms, titleHit });
+    }
+    return results;
   }
 
   private formatSearchResults(
@@ -858,14 +981,57 @@ export class FilesystemMemoryRepository {
     records: MemoryRecord[],
     max: number | undefined,
     archivedRecordIds: Set<string>,
+    categoryFilter?: Set<string>,
   ): MemorySearchResult[] {
-    const sorted = records.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-    return sorted
-      .filter((record) => `${record.title}\n${record.content}`.toLocaleLowerCase().includes(query))
+    // M2/M3/M4 打分排序 —— 按审计 §3.3-M2 的原始公式实现（不自行简化权重）：
+    //   score = (整串命中 title ? 10 : 整串命中 content ? 4 : 0)
+    //         + (整串命中 keywords ? 8 : 0)
+    //         + Σ(每个查询词): (命中 title/keywords ? 3 : 命中 content ? 1 : 0)
+    //   × (1 + 0.1×provenance.score + 0.02×min(5, provenance.reinforcement))
+    //   并列时 updatedAt 新者在前；查询词用 tokenize 切分（多词、中文 bigram）。
+    // 修复前为"filter(includes) + recency 排序"——"新而弱相关"压"旧而强相关"。
+    // 权重序 10>8>4 / 3>1 天然保证：错误 keywords（8）压不过整串标题命中（10）。
+    // 入围边界保持既有契约：title/keywords/content 必须整串包含查询（token 打分
+    // 只影响整串命中集合内的排序——多词查询里词频高的记录排前）。
+    const queryTokens = [...new Set(tokenize(query).map((t) => t.toLocaleLowerCase()))].filter((t) => t.length > 0);
+    const matchTextOf = (record: MemoryRecord): string =>
+      `${record.title}\n${(record.keywords ?? []).join(" ")}\n${record.content}`.toLocaleLowerCase();
+    const relevanceOf = (record: MemoryRecord): number => {
+      const title = record.title.toLocaleLowerCase();
+      const content = record.content.toLocaleLowerCase();
+      const keywords = (record.keywords ?? []).join(" ").toLocaleLowerCase();
+      let rel = 0;
+      if (title.includes(query)) rel += 10;
+      else if (content.includes(query)) rel += 4;
+      if (keywords.includes(query)) rel += 8;
+      for (const tok of queryTokens) {
+        if (title.includes(tok) || keywords.includes(tok)) rel += 3;
+        else if (content.includes(tok)) rel += 1;
+      }
+      const reinforcement = typeof record.provenance?.reinforcement === "number" ? record.provenance.reinforcement : 0;
+      const score = typeof record.provenance?.score === "number" ? record.provenance.score : 0;
+      rel *= 1 + 0.1 * Math.min(Math.max(score, 0), 1) + 0.02 * Math.min(Math.max(reinforcement, 0), 5);
+      return rel;
+    };
+
+    return records
+      .filter((record) => (!categoryFilter || categoryFilter.has(record.category)) && matchTextOf(record).includes(query))
+      .map((record) => ({ record, rel: relevanceOf(record) }))
+      .sort((a, b) =>
+        a.rel !== b.rel
+          ? b.rel - a.rel
+          : b.record.updatedAt.localeCompare(a.record.updatedAt),
+      )
       .slice(0, Math.max(0, max ?? 10))
-      .map((record) => {
-        const text = `${record.title}\n${record.content}`;
-        const index = text.toLocaleLowerCase().indexOf(query);
+      .map(({ record }) => {
+        // 3a M3：snippet 基于含 keywords 的匹配文本。整串未命中时（纯 token 命中）
+        // 退回第一个命中 token 的位置，避免 indexOf=-1 产出空 snippet。
+        const text = matchTextOf(record);
+        let index = text.indexOf(query);
+        if (index < 0) {
+          const hitToken = queryTokens.find((tok) => text.includes(tok));
+          index = hitToken ? text.indexOf(hitToken) : 0;
+        }
         const start = Math.max(0, index - 60);
         const end = Math.min(text.length, index + query.length + 140);
         return {
@@ -968,6 +1134,33 @@ export class FilesystemMemoryRepository {
 
   async markProjectActive(cwd: string): Promise<ProjectMemoryMetadata> {
     const project = resolveProjectIdentity(cwd);
+    // P2 节流：每轮 before_agent_start 都调一次，但生命周期阈值是 30/90 天，
+    // 5 分钟粒度内重复激活无语义价值。先无锁读现有 metadata，若 lastActiveAt
+    // 在活跃阈值内且未被归档，直接返回现有 metadata——跳过写锁获取 + 原子写盘。
+    // 写锁/写盘从"每轮 2 次"降到"约每 5 分钟 1 次"。失败兜底：读取或比较异常
+    // 一律走原路径写入，绝不因节流而静默跳过激活。
+    const MARK_ACTIVE_REFRESH_MS = 5 * 60 * 1000;
+    try {
+      const base = this.basePath("project", project.id);
+      const [archivedExists, previous] = await Promise.all([
+        exists(this.archivedProjectPath(project.id)),
+        this.readMetadata(base),
+      ]);
+      if (
+        !archivedExists &&
+        previous &&
+        previous.status === "active" &&
+        typeof previous.lastActiveAt === "string"
+      ) {
+        const elapsed = this.now().getTime() - new Date(previous.lastActiveAt).getTime();
+        if (Number.isFinite(elapsed) && elapsed >= 0 && elapsed < MARK_ACTIVE_REFRESH_MS) {
+          return previous;
+        }
+      }
+    } catch {
+      // 节流读取失败：退化到下面的权威写入路径。
+    }
+
     return this.withWriteLock(async () => {
       const activePath = this.basePath("project", project.id);
       const archivedPath = this.archivedProjectPath(project.id);
@@ -1013,6 +1206,13 @@ export class FilesystemMemoryRepository {
       await this.atomicWrite(path.join(source, "project.json"), `${JSON.stringify(metadata, null, 2)}\n`);
       await fs.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
       await fs.rename(source, target);
+      // rename moves the whole project dir between active/archive positions:
+      // both partitions may have been read & cached. Invalidate both + bump stamp.
+      await this.invalidateCacheSlicesUnlocked([`project:${project.id}`, `archived:${project.id}`]);
+      // working-manifests/ and extractions/ live OUTSIDE basePath, so the rename
+      // leaves them behind as orphans. Run a full GC sweep now that the project is
+      // being archived (P4). Already inside the write lock.
+      await this.pruneProjectUnlocked(project.id, { fullSweep: true });
       return metadata;
     });
   }
@@ -1052,13 +1252,153 @@ export class FilesystemMemoryRepository {
         await this.atomicWrite(path.join(source, "project.json"), `${JSON.stringify(archivedMetadata, null, 2)}\n`);
         throw error;
       }
+      // rename moved the whole project dir from archive back to active: both
+      // partitions may have been read & cached. Invalidate both + bump stamp.
+      await this.invalidateCacheSlicesUnlocked([`project:${project.id}`, `archived:${project.id}`]);
       return metadata;
     });
   }
 
+  /**
+   * Opportunistic / full-sweep garbage collection for the four unbounded data
+   * categories (Phase 2a P4). Mirrors the retention policy defined in
+   * docs/technical/14-audit-memory-retrieval-and-reviewer.md §5.2-P4.
+   */
+  async pruneProject(cwd: string, opts?: { fullSweep?: boolean }): Promise<{ pruned: number; rebuiltIndex: boolean }> {
+    const project = resolveProjectIdentity(cwd);
+    return this.withWriteLock(async () => this.pruneProjectUnlocked(project.id, opts));
+  }
+
+  private async pruneProjectUnlocked(
+    projectId: string,
+    opts?: { fullSweep?: boolean },
+  ): Promise<{ pruned: number; rebuiltIndex: boolean }> {
+    const budget = opts?.fullSweep ? Number.POSITIVE_INFINITY : PRUNE_MAX_FILES;
+    const deadline = this.now().getTime();
+    let remaining = budget;
+    let totalPruned = 0;
+    let rebuiltIndex = false;
+
+    // 1. working manifests: keep PRUNE_WORKING_DAYS by updatedAt.
+    const manifestsDir = path.join(this.root, "working-manifests", projectId);
+    const workingCutoff = deadline - PRUNE_WORKING_DAYS * DAY_MS;
+    let workingPruned = 0;
+    if (await exists(manifestsDir)) {
+      for (const filename of await fs.readdir(manifestsDir)) {
+        if (remaining <= 0) break;
+        if (!filename.endsWith(".json") || filename === "latest-index.json") continue;
+        const filepath = path.join(manifestsDir, filename);
+        let shouldRemove = false;
+        try {
+          const raw = JSON.parse(await fs.readFile(filepath, "utf8"));
+          const update = parseWorkingStateUpdate(raw);
+          if (Date.parse(update.updatedAt) < workingCutoff) shouldRemove = true;
+        } catch {
+          // Corrupt manifest — safe to remove.
+          shouldRemove = true;
+        }
+        if (shouldRemove) {
+          await fs.rm(filepath, { force: true });
+          remaining -= 1;
+          workingPruned += 1;
+          totalPruned += 1;
+        }
+      }
+    }
+    if (workingPruned > 0) {
+      // Recompute the index from surviving manifests so it cannot reference pruned sourceHashes.
+      await this.rebuildLatestIndexUnlocked(projectId, manifestsDir);
+      rebuiltIndex = true;
+    }
+
+    // 2. daily files: keep PRUNE_DAILY_DAYS by filename date.
+    const dailyDir = path.join(this.basePath("project", projectId), "daily");
+    const dailyCutoff = deadline - PRUNE_DAILY_DAYS * DAY_MS;
+    if (await exists(dailyDir)) {
+      for (const filename of await fs.readdir(dailyDir)) {
+        if (remaining <= 0) break;
+        if (!/^\d{4}-\d{2}-\d{2}\.md$/.test(filename)) continue;
+        const dayMs = Date.parse(filename.slice(0, 10));
+        if (!Number.isNaN(dayMs) && dayMs < dailyCutoff) {
+          await fs.rm(path.join(dailyDir, filename), { force: true });
+          remaining -= 1;
+          totalPruned += 1;
+        }
+      }
+    }
+
+    // 3. revisions: keep PRUNE_REVISION_KEEP most-recent per recordId.
+    const projectBase = this.basePath("project", projectId);
+    const revisionsDir = path.join(projectBase, "revisions");
+    if (await exists(revisionsDir)) {
+      for (const recordId of await fs.readdir(revisionsDir, { withFileTypes: true })) {
+        if (remaining <= 0) break;
+        if (!recordId.isDirectory()) continue;
+        const recordDir = path.join(revisionsDir, recordId.name);
+        const files: { name: string; mtime: number }[] = [];
+        for (const entry of await fs.readdir(recordDir, { withFileTypes: true })) {
+          if (!entry.isFile() || !entry.name.endsWith(".md")) continue;
+          const st = await fs.stat(path.join(recordDir, entry.name));
+          files.push({ name: entry.name, mtime: st.mtime.getTime() });
+        }
+        if (files.length <= PRUNE_REVISION_KEEP) continue;
+        files.sort((a, b) => b.mtime - a.mtime);
+        for (const file of files.slice(PRUNE_REVISION_KEEP)) {
+          if (remaining <= 0) break;
+          await fs.rm(path.join(recordDir, file.name), { force: true });
+          remaining -= 1;
+          totalPruned += 1;
+        }
+      }
+    }
+
+    // 4. extraction manifests: keep PRUNE_EXTRACTION_DAYS by mtime.
+    const extractionsDir = path.join(this.root, "extractions", projectId);
+    const extractionCutoff = deadline - PRUNE_EXTRACTION_DAYS * DAY_MS;
+    if (await exists(extractionsDir)) {
+      for (const filename of await fs.readdir(extractionsDir)) {
+        if (remaining <= 0) break;
+        if (!filename.endsWith(".json")) continue;
+        const filepath = path.join(extractionsDir, filename);
+        const st = await fs.stat(filepath);
+        if (st.mtime.getTime() < extractionCutoff) {
+          await fs.rm(filepath, { force: true });
+          remaining -= 1;
+          totalPruned += 1;
+        }
+      }
+    }
+
+    return { pruned: totalPruned, rebuiltIndex };
+  }
+
   async rebuildIndex(scope: MemoryScope, cwd: string): Promise<void> {
     const project = resolveProjectIdentity(cwd);
-    await this.withWriteLock(() => this.rebuildIndexUnlocked(scope, project));
+    await this.withWriteLock(async () => {
+      await this.rebuildIndexUnlocked(scope, project);
+      this.pendingIndexRebuild.delete(this.basePath(scope, project.id));
+    });
+  }
+
+  /**
+   * Flush deferred MEMORY.md rebuilds for this project (global + project bases).
+   * Called opportunistically from session_start / memory-status — cheap no-op when
+   * nothing is dirty. MEMORY.md is a derived convenience index, so staleness here
+   * never affects retrieval or injection.
+   */
+  async rebuildPendingIndexes(cwd: string): Promise<void> {
+    const project = resolveProjectIdentity(cwd);
+    const bases = [this.basePath("global", project.id), this.basePath("project", project.id)];
+    const dirty = bases.filter((b) => this.pendingIndexRebuild.has(b));
+    if (dirty.length === 0) return;
+    await this.withWriteLock(async () => {
+      for (const base of dirty) {
+        if (!this.pendingIndexRebuild.has(base)) continue;
+        const scope: MemoryScope = base === this.basePath("global", project.id) ? "global" : "project";
+        await this.rebuildIndexUnlocked(scope, project);
+        this.pendingIndexRebuild.delete(base);
+      }
+    });
   }
 
   /** List all revision snapshots for a given record. */
@@ -1123,6 +1463,156 @@ export class FilesystemMemoryRepository {
     return path.join(this.root, "working-manifests", projectId, `${sourceHash}.json`);
   }
 
+  /** Path to the working-manifest index (Phase 2a P3). Sits in the manifests dir
+   *  alongside the per-turn manifest files; full-scan rebuilds skip it by name. */
+  private workingLatestIndexPath(projectId: string): string {
+    return path.join(this.root, "working-manifests", projectId, "latest-index.json");
+  }
+
+  // ── Working-manifest index (2a P3): O(1) saveWorkingState ──────────────────
+  // All `*Unlocked` methods MUST be called inside withWriteLock: they read/write
+  // the index and the manifest dir, sharing the dir with saveWorkingState. The
+  // index is read fresh from disk each call (no in-process cross-call copy), so
+  // it needs no .cache-stamp validation — the lock serializes writers.
+
+  /** Read & strictly parse the index. Any malformation → undefined (triggers rebuild). */
+  private async readLatestIndexUnlocked(projectId: string): Promise<WorkingLatestIndex | undefined> {
+    const filepath = this.workingLatestIndexPath(projectId);
+    if (!(await exists(filepath))) return undefined;
+    try {
+      return parseWorkingLatestIndex(JSON.parse(await fs.readFile(filepath, "utf8")));
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Authoritative full O(M) scan fallback. Reads all manifests, derives the index,
+   *  writes it, returns it. Skips latest-index.json and non-.json entries. */
+  private async rebuildLatestIndexUnlocked(projectId: string, manifestsDir: string): Promise<WorkingLatestIndex> {
+    const updates: WorkingStateUpdate[] = [];
+    if (await exists(manifestsDir)) {
+      for (const filename of await fs.readdir(manifestsDir)) {
+        if (!filename.endsWith(".json") || filename === "latest-index.json") continue;
+        try {
+          updates.push(parseWorkingStateUpdate(JSON.parse(await fs.readFile(path.join(manifestsDir, filename), "utf8"))));
+        } catch {
+          // Corrupt/unreadable manifest — skip (matches the legacy scan's silent tolerance).
+        }
+      }
+    }
+    updates.sort((left, right) => left.updatedAt.localeCompare(right.updatedAt));
+    // saveWorkingState writes the manifest before reading the index, so at least the
+    // incoming manifest is present. If the dir is genuinely empty (no manifests yet),
+    // there is no latestUpdate to point at — return an empty-but-valid index the caller
+    // will immediately merge against.
+    if (updates.length === 0) {
+      const empty: WorkingLatestIndex = {
+        schemaVersion: WORKING_INDEX_SCHEMA_VERSION,
+        date: "",
+        latestUpdate: undefined as unknown as WorkingStateUpdate,
+        sameDayEntries: [],
+        manifestCount: 0,
+      };
+      return empty;
+    }
+    const latestUpdate = updates[updates.length - 1];
+    const sameDayEntries = updates
+      .filter((u) => u.date === latestUpdate.date)
+      .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))
+      .slice(-MAX_SAMEDAY_ENTRIES);
+    const index: WorkingLatestIndex = {
+      schemaVersion: WORKING_INDEX_SCHEMA_VERSION,
+      date: latestUpdate.date,
+      latestUpdate,
+      sameDayEntries,
+      manifestCount: updates.length,
+    };
+    await this.atomicWrite(this.workingLatestIndexPath(projectId), serializeWorkingLatestIndex(index));
+    return index;
+  }
+
+  /** Increment-merge an incoming update into the index WITHOUT writing. If the index
+   *  is missing/empty, rebuild is authoritative (the incoming manifest is already on
+   *  disk, so rebuild counts it). The four branches below preserve the legacy
+   *  `updates.at(-1)` semantics (max updatedAt wins latest) without the scan. */
+  private mergeLatestIndexUnlocked(
+    index: WorkingLatestIndex | undefined,
+    incoming: WorkingStateUpdate,
+    manifestsDir: string,
+    projectId: string,
+  ): Promise<WorkingLatestIndex> {
+    // No usable index (missing, corrupt, or the empty placeholder) → rebuild reads
+    // the manifest dir (which already contains the just-written incoming manifest)
+    // and returns an authoritative index that already reflects incoming. No re-merge.
+    if (!index || index.manifestCount === 0 || !index.date) {
+      return this.rebuildLatestIndexUnlocked(projectId, manifestsDir);
+    }
+
+    const maxUpdate = (a: WorkingStateUpdate, b: WorkingStateUpdate): WorkingStateUpdate =>
+      a.updatedAt.localeCompare(b.updatedAt) >= 0 ? a : b;
+
+    const hadSourceHash = index.sameDayEntries.some((e) => e.sourceHash === incoming.sourceHash);
+
+    // Date rollover: a new day's first turn resets the same-day window.
+    if (incoming.date !== index.date) {
+      const merged: WorkingLatestIndex = {
+        schemaVersion: WORKING_INDEX_SCHEMA_VERSION,
+        date: incoming.date,
+        latestUpdate: maxUpdate(index.latestUpdate, incoming),
+        sameDayEntries: [incoming],
+        manifestCount: index.manifestCount + (hadSourceHash ? 0 : 1),
+      };
+      return Promise.resolve(merged);
+    }
+
+    // Same day. Replace any prior occurrence of this sourceHash, then append incoming.
+    const sameDay = [...index.sameDayEntries.filter((e) => e.sourceHash !== incoming.sourceHash), incoming]
+      .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))
+      .slice(-MAX_SAMEDAY_ENTRIES);
+    const merged: WorkingLatestIndex = {
+      schemaVersion: WORKING_INDEX_SCHEMA_VERSION,
+      date: index.date,
+      latestUpdate: maxUpdate(index.latestUpdate, incoming),
+      sameDayEntries: sameDay,
+      manifestCount: index.manifestCount + (hadSourceHash ? 0 : 1),
+    };
+    // If the cap dropped an entry, manifestCount still reflects on-disk manifests
+    // (the dropped manifest is NOT deleted — only the projection is capped), so
+    // manifestCount stays accurate; the dropped entry simply ages out of the daily tail.
+    return Promise.resolve(merged);
+  }
+
+  private async writeLatestIndexUnlocked(projectId: string, index: WorkingLatestIndex): Promise<void> {
+    await this.atomicWrite(this.workingLatestIndexPath(projectId), serializeWorkingLatestIndex(index));
+  }
+
+  /** Read the index, falling back to a full rebuild if it is missing/corrupt.
+   *  Risk-C self-heal: if the on-disk manifest count disagrees with the index by
+   *  anything other than the caller's expectedExtra (e.g. a crash between writing
+   *  the manifest and writing the index left an orphaned manifest), rebuild.
+   *  expectedExtra is the number of manifests the caller just wrote before this
+   *  read (saveWorkingState passes 1 when its manifest was new, 0 on refresh) —
+   *  this keeps the steady-state path a pure O(1) index read + one readdir. */
+  private async loadLatestIndexUnlocked(
+    projectId: string,
+    manifestsDir: string,
+    expectedExtra = 0,
+  ): Promise<WorkingLatestIndex> {
+    const index = await this.readLatestIndexUnlocked(projectId);
+    if (index && index.manifestCount > 0 && index.date) {
+      try {
+        const entries = await fs.readdir(manifestsDir);
+        const manifestFileCount = entries.filter((n) => n.endsWith(".json") && n !== "latest-index.json").length;
+        if (manifestFileCount === index.manifestCount + expectedExtra) return index;
+        // Mismatch → some manifest is not reflected in the index. Rebuild.
+      } catch {
+        // readdir failed; trust the index (read path defense).
+        return index;
+      }
+    }
+    return this.rebuildLatestIndexUnlocked(projectId, manifestsDir);
+  }
+
   private async listUnlocked(project: ProjectIdentity, options: ListMemoryOptions): Promise<MemoryRecord[]> {
     const [global, scoped, archived] = await Promise.all([
       this.listBase(this.basePath("global", project.id)),
@@ -1180,7 +1670,75 @@ export class FilesystemMemoryRepository {
     return metadata;
   }
 
+  /**
+   * Cache slice key for a base directory. The three read partitions map to:
+   *   global              — root/global                   (shared by all projects)
+   *   project:<id>        — root/projects/<id>
+   *   archived:<id>       — root/archive/projects/<id>
+   * archiveProject/restoreProject rename whole directories, so a project's
+   * records can appear under either partition — cache must invalidate both.
+   */
+  private sliceKeyFor(base: string): string {
+    const archivedPrefix = path.join(this.root, "archive", "projects") + path.sep;
+    const projectPrefix = path.join(this.root, "projects") + path.sep;
+    const globalDir = path.join(this.root, "global");
+    if (base === globalDir) return "global";
+    if (base.startsWith(archivedPrefix)) return `archived:${base.slice(archivedPrefix.length)}`;
+    if (base.startsWith(projectPrefix)) return `project:${base.slice(projectPrefix.length)}`;
+    return base; // 未识别分区：以 base 自身为 key（退化，仍正确，只是不共享失效）
+  }
+
+  /** Read the cross-process write token. Missing/unreadable ⇒ "" (treated as stale). */
+  private async readCacheStamp(): Promise<string> {
+    try {
+      const filepath = path.join(this.root, FilesystemMemoryRepository.CACHE_STAMP_NAME);
+      if (!(await exists(filepath))) return "";
+      return (await fs.readFile(filepath, "utf8")).trim();
+    } catch {
+      return "";
+    }
+  }
+
+  /** Bump the write token inside the write lock so concurrent readers see the change. */
+  private async bumpCacheStampUnlocked(): Promise<void> {
+    this.cacheStampSeq = (this.cacheStampSeq + 1) % Number.MAX_SAFE_INTEGER;
+    await this.atomicWrite(
+      path.join(this.root, FilesystemMemoryRepository.CACHE_STAMP_NAME),
+      `${this.cacheStampSeq}\n`,
+    );
+  }
+
+  /**
+   * Drop the given cache slices (in-process staleness) and bump the write token
+   * (cross-process staleness). Must be called inside the write lock, after the
+   * on-disk mutation has committed, so the token bump publishes atomically with
+   * the data change.
+   */
+  private async invalidateCacheSlicesUnlocked(sliceKeys: string[]): Promise<void> {
+    for (const key of sliceKeys) this.recordCache.delete(key);
+    await this.bumpCacheStampUnlocked();
+  }
+
   private async listBase(base: string): Promise<MemoryRecord[]> {
+    const sliceKey = this.sliceKeyFor(base);
+
+    // 跨进程失效：读前比对写令牌。令牌变了 ⇒ 别的进程写过 ⇒ 丢弃该片重读。
+    // 读取失败/缺失 ⇒ 安全降级为 stale，重读，绝不返回可能过期的数据。
+    const currentStamp = await this.readCacheStamp();
+    const cached = this.recordCache.get(sliceKey);
+    if (cached && cached.stampAtLoad === currentStamp) {
+      return cached.records.slice(); // 浅拷贝：调用方不可 mutate 缓存条目
+    }
+
+    const records = await this.scanRecordsUnlocked(base);
+    // 空结果也缓存（避免对空项目反复扫描）；stampAtLoad 用当前令牌。令牌为空串
+    // 时（首启、无 .cache-stamp）仍缓存——首次写会 bump 令牌并删片，不会长期陈旧。
+    this.recordCache.set(sliceKey, { records, stampAtLoad: currentStamp });
+    return records.slice();
+  }
+
+  /** On-disk directory scan — the O(N) path the cache front-ends. */
+  private async scanRecordsUnlocked(base: string): Promise<MemoryRecord[]> {
     const entriesDir = path.join(base, "entries");
     if (!(await exists(entriesDir))) return [];
 

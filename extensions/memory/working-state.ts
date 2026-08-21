@@ -34,6 +34,16 @@ export const WORKING_OUTCOME_MAX_CHARS = envInt("TRIPLE_PI_WORKING_OUTCOME_MAX_C
 export const SCRATCHPAD_MAX_CHARS = envInt("TRIPLE_PI_SCRATCHPAD_MAX_CHARS", 8_000);
 export const DAILY_MAX_CHARS = envInt("TRIPLE_PI_DAILY_MAX_CHARS", 64_000);
 
+// ── Phase 2a P4 retention policy (pruneProject) ──────────────────────────────
+// Soft bounds; prune runs off the hot path (session_start opportunistic, archive
+// full sweep). Override via env. Defaults per docs/technical/14-audit… §5.2-P4.
+export const PRUNE_WORKING_DAYS = envInt("TRIPLE_PI_PRUNE_WORKING_DAYS", 30);
+export const PRUNE_DAILY_DAYS = envInt("TRIPLE_PI_PRUNE_DAILY_DAYS", 180);
+export const PRUNE_REVISION_KEEP = envInt("TRIPLE_PI_PRUNE_REVISION_KEEP", 10);
+export const PRUNE_EXTRACTION_DAYS = envInt("TRIPLE_PI_PRUNE_EXTRACTION_DAYS", 90);
+/** Max files a non-fullSweep pruneProject deletes per call (session_start rate limit). */
+export const PRUNE_MAX_FILES = envInt("TRIPLE_PI_PRUNE_MAX_FILES", 100);
+
 // ── Field semantic rename ──────────────────────────────────────
 // currentRequest → userRequest (what the user typed)
 // latestOutcome → assistantReportedOutcome (unverified assistant report)
@@ -264,6 +274,102 @@ export function parseWorkingLatest(value: unknown): { sessionKey: string; update
   }
 
   return { sessionKey, update };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Working-manifest index (Phase 2a — P3: make saveWorkingState O(1))
+// ═══════════════════════════════════════════════════════════════
+// saveWorkingState used to readdir+parse every working manifest each turn just
+// to compute latestUpdate (max updatedAt) and sameDay (entries whose date ===
+// today). That is O(M) per turn → O(M²) cumulative. This index caches exactly
+// those two derivations, updated incrementally inside the write lock, with a
+// full-scan rebuild as the self-healing fallback (same guarded-cache posture as
+// the record cache). Only the write path reads/writes it; loadWorkingState is
+// already O(1) via latest.json and does not touch it.
+
+export const WORKING_INDEX_SCHEMA_VERSION = 1;
+
+/**
+ * Hard cap on sameDayEntries breadth so a pathological same-day set (e.g. the
+ * bench's "1000 turns stamped the same day") cannot make the index unbounded.
+ * The daily file is already truncated by DAILY_MAX_CHARS, so dropping the
+ * oldest same-day entry only affects the daily-file projection tail — it never
+ * affects latestUpdate correctness. Override via env.
+ */
+export const MAX_SAMEDAY_ENTRIES = envInt("TRIPLE_PI_WORKING_SAMEDAY_MAX", 500);
+
+export interface WorkingLatestIndex {
+  schemaVersion: typeof WORKING_INDEX_SCHEMA_VERSION;
+  /** YYYY-MM-DD — the day sameDayEntries is scoped to (kept === latestUpdate.date). */
+  date: string;
+  /** The update with max updatedAt across all manifests — what latest.json points at. */
+  latestUpdate: WorkingStateUpdate;
+  /** Entries whose date === index.date. Sorted by updatedAt ascending; cap MAX_SAMEDAY_ENTRIES. */
+  sameDayEntries: WorkingStateUpdate[];
+  /** Count of *.json manifests in the dir (not counting this index file itself). */
+  manifestCount: number;
+}
+
+/** Strictly parse a WorkingLatestIndex; throws WorkingValidationError on any malformation. */
+export function parseWorkingLatestIndex(value: unknown): WorkingLatestIndex {
+  if (!isObject(value)) throw new WorkingValidationError("invalid-version", "WorkingLatestIndex must be an object");
+
+  const schemaVersion = value["schemaVersion"];
+  if (schemaVersion !== WORKING_INDEX_SCHEMA_VERSION) {
+    throw new WorkingValidationError("invalid-version", `Expected index schemaVersion ${WORKING_INDEX_SCHEMA_VERSION}, got ${String(schemaVersion)}`);
+  }
+
+  const date = parseString(value["date"], "date");
+  if (!date || !DATE_ONLY.test(date)) {
+    throw new WorkingValidationError("invalid-date", "index date must be a YYYY-MM-DD string");
+  }
+
+  const latestUpdate = parseWorkingStateUpdate(value["latestUpdate"]);
+  // Invariant: index.date === latestUpdate.date. saveWorkingState sets index.date
+  // from the incoming update's date, and latestUpdate is max(updatedAt) which lands
+  // on the same day in steady state. A mismatch indicates desync → force rebuild.
+  if (latestUpdate.date !== date) {
+    throw new WorkingValidationError("invalid-date", `latestUpdate.date ${latestUpdate.date} !== index.date ${date}`);
+  }
+
+  const rawEntries = value["sameDayEntries"];
+  if (!Array.isArray(rawEntries)) {
+    throw new WorkingValidationError("invalid-sourceEntryIds", "sameDayEntries must be an array");
+  }
+  if (rawEntries.length > MAX_SAMEDAY_ENTRIES) {
+    throw new WorkingValidationError("invalid-sourceEntryIds", `sameDayEntries exceeds MAX_SAMEDAY_ENTRIES (${MAX_SAMEDAY_ENTRIES})`);
+  }
+  const seen = new Set<string>();
+  const sameDayEntries: WorkingStateUpdate[] = [];
+  for (const raw of rawEntries) {
+    const entry = parseWorkingStateUpdate(raw);
+    if (entry.date !== date) {
+      throw new WorkingValidationError("invalid-date", "a sameDayEntry date does not match index.date");
+    }
+    // Dedup guard: a double-append drift would produce a stale entry list. Force rebuild.
+    if (seen.has(entry.sourceHash)) {
+      throw new WorkingValidationError("invalid-sourceHash", `duplicate sourceHash in sameDayEntries: ${entry.sourceHash}`);
+    }
+    seen.add(entry.sourceHash);
+    sameDayEntries.push(entry);
+  }
+
+  const manifestCount = value["manifestCount"];
+  if (typeof manifestCount !== "number" || !Number.isInteger(manifestCount) || manifestCount < sameDayEntries.length) {
+    throw new WorkingValidationError("invalid-version", "manifestCount must be an integer ≥ sameDayEntries.length");
+  }
+
+  // latestUpdate must itself be a member of sameDayEntries (it shares index.date,
+  // so every same-day update including the latest is listed). Force rebuild if not.
+  if (!seen.has(latestUpdate.sourceHash)) {
+    throw new WorkingValidationError("invalid-sourceHash", "latestUpdate is not present in sameDayEntries");
+  }
+
+  return { schemaVersion, date, latestUpdate, sameDayEntries, manifestCount };
+}
+
+export function serializeWorkingLatestIndex(index: WorkingLatestIndex): string {
+  return `${JSON.stringify(index, null, 2)}\n`;
 }
 
 // ═══════════════════════════════════════════════════════════════

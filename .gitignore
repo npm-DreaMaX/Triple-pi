@@ -3,8 +3,11 @@ dist/
 .env
 eval/.eval-home/
 eval/results/
+# 性能基准运行产物（机器相关，不入库）
+scripts/perf-bench-result.json
 .claude/
 coverage/
 *.log
 *.lock.tmp
 *.jsonl
+index-intro-backup.html

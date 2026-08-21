@@ -170,11 +170,15 @@ export class SubAgentManager {
       // Parse the output
       const parseResult = parseReviewerOutput(lastText);
 
-      // Build telemetry
+      // Build telemetry. S3 修复：成功路径 parsedChunks 此前硬编码 0（误导性，
+      // 与"一次 manager 调用完整审查一个 chunk"的注释相悖）。用户可见的
+      // "分片：X/Y" 走 aggregator（正确计数），此处是 per-manager 内部遥测，
+      // 修正为反映本 chunk 实际解析结果，避免内部字段与事实不符。
+      const parseOk = parseResult.ok;
       const telemetry: ReviewerTelemetry = {
         totalChunks: options.chunkCount,
-        parsedChunks: 0,
-        failedChunks: 0,
+        parsedChunks: parseOk ? 1 : 0,
+        failedChunks: parseOk ? 0 : 1,
         worktreeChanged: false,
       };
 

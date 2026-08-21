@@ -134,7 +134,8 @@ describe("FilesystemMemoryRepository", () => {
     });
     const project = resolveProjectIdentity(projectA);
     const indexPath = path.join(tempDir, "projects", project.id, "MEMORY.md");
-    await fs.rm(indexPath);
+    // 写放大修复后 save 只标脏不建索引（文件可能不存在），显式 rebuildIndex 仍须重建。
+    await fs.rm(indexPath, { force: true });
 
     await repository.rebuildIndex("project", projectA);
     expect(await fs.readFile(indexPath, "utf8")).toContain("TypeScript Experience");
@@ -254,6 +255,8 @@ describe("FilesystemMemoryRepository", () => {
 
     expect(await repository.list(projectA)).toHaveLength(20);
     const project = resolveProjectIdentity(projectA);
+    // 写放大修复：MEMORY.md 不再每 save 全量重建，而是脏标记 + 延迟刷新。
+    await repository.rebuildPendingIndexes(projectA);
     const index = await fs.readFile(path.join(tempDir, "projects", project.id, "MEMORY.md"), "utf8");
     expect(index.match(/^- \[/gm)).toHaveLength(20);
   });

@@ -37,6 +37,8 @@ export interface ExtractedCandidate {
   resolvedScope: MemoryScope;
   /** @deprecated Use resolvedScope. Retained for compatibility with consolidation callers. */
   scope: MemoryScope;
+  /** 3a M3: retrieval keywords. Optional in the LLM schema; validated and normalized here. */
+  keywords?: string[];
 }
 
 export class CandidateValidationError extends Error {
@@ -98,9 +100,18 @@ export function validateCandidates(raw: string, source: ExtractionSource): Extra
   for (const value of parsed) {
     if (!plainObject(value)) throw new CandidateValidationError("Extraction candidate failed strict validation");
     const keys = Object.keys(value).sort();
-    const expected = ["category", "content", "evidence", "scope", "sourceEntryId", "title"];
-    if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) throw new CandidateValidationError("Extraction candidate failed strict validation");
+    // 3a M3：未知 key 拒绝保持——keywords 是唯一白名单新增键（可选）。
+    const required = ["category", "content", "evidence", "scope", "sourceEntryId", "title"];
+    const allowed = new Set([...required, "keywords"]);
+    const missing = required.filter((k) => !keys.includes(k));
+    const unknown = keys.filter((k) => !allowed.has(k));
+    if (missing.length > 0 || unknown.length > 0) throw new CandidateValidationError("Extraction candidate failed strict validation");
     const { category, title, content, evidence, sourceEntryId, scope } = value;
+    const rawKeywords = value["keywords"];
+    if (rawKeywords !== undefined && (!Array.isArray(rawKeywords) || rawKeywords.length > 5 ||
+      rawKeywords.some((k) => typeof k !== "string" || !k.trim() || k.trim().length > 60))) {
+      throw new CandidateValidationError("Extraction candidate keywords must be ≤5 non-empty strings of ≤60 chars");
+    }
     if (
       typeof category !== "string" || !isMemoryCategory(category) ||
       typeof title !== "string" || !title.trim() || title.length > MAX_TITLE_LENGTH ||
@@ -131,6 +142,9 @@ export function validateCandidates(raw: string, source: ExtractionSource): Extra
       requestedScope: scope,
       resolvedScope: validatedScope,
       scope: validatedScope,
+      ...(rawKeywords !== undefined && rawKeywords.length > 0
+        ? { keywords: [...new Set(rawKeywords.map((k) => k.trim()))] }
+        : {}),
     });
   }
   return candidates;

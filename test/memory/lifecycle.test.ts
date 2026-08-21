@@ -59,6 +59,26 @@ describe("project memory lifecycle", () => {
     expect(await repository.getProjectLifecycle(cwd)).toMatchObject({ state: "hot", inactivityDays: 0 });
   });
 
+  it("throttles repeat markProjectActive within refresh window (P2)", async () => {
+    // P2：5 分钟内重复激活应短路，不重复取写锁写盘。
+    await seed();
+    advanceDays(31);
+    const first = await repository.markProjectActive(cwd);
+    expect(first.lastActiveAt).toBe(now.toISOString());
+
+    // 同一时刻（< 5 分钟）再激活：应返回同一 lastActiveAt，不重写。
+    now = new Date(now.getTime() + 60_000); // +1 min
+    const second = await repository.markProjectActive(cwd);
+    expect(second.lastActiveAt).toBe(first.lastActiveAt); // 未刷新
+    expect(second.projectId).toBe(first.projectId); // 同一项目
+
+    // 超过 5 分钟：应刷新 lastActiveAt。
+    now = new Date(Date.parse(first.lastActiveAt) + 6 * 60_000); // 首次后 +6 min
+    const third = await repository.markProjectActive(cwd);
+    expect(third.lastActiveAt).toBe(now.toISOString()); // 已刷新
+    expect(third.lastActiveAt).not.toBe(first.lastActiveAt);
+  });
+
   it("archives without deleting and excludes archived entries by default", async () => {
     await seed();
     advanceDays(91);

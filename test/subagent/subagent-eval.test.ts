@@ -185,6 +185,61 @@ describe("extractReviewSearchTerms — production dedup and coverage", () => {
     expect(terms).toContain("checkout");
     expect(terms).toContain("condition");
   });
+
+  it("S1: emits CJK bigram terms for Chinese code/comments (was ≈0 before fix)", () => {
+    // S1 修复前：Tier5 用 /^[a-zA-Z_]\w*$/ 过滤，纯中文 diff/注释产出零内容词，
+    // reviewer 记忆召回≈0。修复后中文走 tokenize bigram。
+    const changes: ChangeFile[] = [{
+      path: "auth.ts",
+      status: "staged",
+      diff: "+// 使用JWT做无状态认证，弃用服务端session\n+function verify(token){}",
+      content: "",
+      binary: false,
+      unreadable: false,
+      skipped: false,
+    }];
+    const terms = extractReviewSearchTerms("审查鉴权模块的认证逻辑", changes);
+    // 英文符号词仍应存在（不回归）
+    expect(terms).toContain("verify");
+    // 至少有一个中文 bigram 内容词（修复前为 0）
+    const cjkTerms = terms.filter((t) => /[^a-zA-Z0-9_]/.test(t));
+    expect(cjkTerms.length).toBeGreaterThan(0);
+    // 关键中文概念应能被切出，使 reviewer 能搜到对应记忆
+    expect(cjkTerms.some((t) => t.includes("认证") || t.includes("鉴权"))).toBe(true);
+  });
+
+  it("S4: filters built-in type names so the top-15 has no language builtins", () => {
+    // S4 修复前：Tier 3 优先级最高，`const x: string` / `data: any` 里的内建类型名
+    // 会挤占前 15 个检索词。修复后内建名被 CODE_STOP_WORDS 滤掉。
+    const changes: ChangeFile[] = [
+      {
+        path: "src/payment.ts",
+        status: "staged",
+        diff: [
+          "diff --git a/src/payment.ts b/src/payment.ts",
+          "@@ -1,3 +1,3 @@",
+          "-function process(payload: string): any {",
+          "+function settleInvoice(payload: string): InvoiceResult {",
+          "+  const amount: number = payload.total;",
+          "+  return { status: 'settled', amount };",
+          "+}",
+        ].join("\n"),
+        content: "",
+        binary: false,
+        unreadable: false,
+        skipped: false,
+      },
+    ];
+    const terms = extractReviewSearchTerms("review the invoice settlement change", changes);
+    expect(terms.length).toBeGreaterThan(0);
+    // 前 15 词中不得有语言内建类型名（string/any/number/object 等）。
+    const builtins = new Set(["any", "string", "number", "object", "boolean", "void", "undefined", "null"]);
+    for (const term of terms.slice(0, 15)) {
+      expect(builtins.has(term)).toBe(false);
+    }
+    // 真正的领域词（symbol/type 名）应保留。
+    expect(terms.some((t) => t.includes("invoiceresult") || t.includes("settleinvoice"))).toBe(true);
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════

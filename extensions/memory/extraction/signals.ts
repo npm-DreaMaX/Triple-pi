@@ -2,13 +2,12 @@ import { createHash } from "node:crypto";
 import type { MemoryScope } from "../domain.ts";
 import type { ExtractedCandidate } from "./pipeline.ts";
 import type { ExtractionMessage } from "./source.ts";
+import { normalizedTokens } from "./tokenize.ts";
 
 const CORRECTION_PATTERNS = [
   /\b(?:actually|correction|instead|no longer|replace .+ with|not .+ but)\b/i,
   /(?:更正|纠正|不是.+而是|不要再.+(?:改用|使用)|改成|以后用|应该改为|不再使用)/,
 ];
-
-const TOKEN_PATTERN = /[\p{L}\p{N}]+/gu;
 
 export interface CandidateSignals {
   fingerprint: string;
@@ -17,14 +16,8 @@ export interface CandidateSignals {
   score: number;
 }
 
-function normalizedTokens(value: string): string[] {
-  return (value.toLocaleLowerCase().match(TOKEN_PATTERN) || [])
-    .filter((token) => token.length > 1)
-    .sort();
-}
-
 export function semanticFingerprint(candidate: Pick<ExtractedCandidate, "category" | "scope" | "title" | "content">): string {
-  const tokens = [...new Set(normalizedTokens(`${candidate.title} ${candidate.content}`))];
+  const tokens = normalizedTokens(`${candidate.title} ${candidate.content}`);
   return createHash("sha256")
     .update(`${candidate.scope}\0${candidate.category}\0${tokens.join("|")}`)
     .digest("hex");

@@ -47,7 +47,8 @@ describe("working state", () => {
     const view = await repository.loadWorkingState(cwd);
     expect(view.scratchpad).toContain("session-2");
     expect(view.recentDaily).toContain("2026-01-03");
-    expect(await repository.searchWorkingState("checkout", cwd)).toHaveLength(2);
+    // 3c M5：scratchpad + 最新 daily + 一天前 daily（"checkout" 在 01-02 与 01-03 都出现）→ 3 条。
+    expect(await repository.searchWorkingState("checkout", cwd)).toHaveLength(3);
   });
 
   it("does not let an older session replace the latest project pointer", async () => {

@@ -17,7 +17,7 @@ import {
   WORKING_CHECKPOINT_TYPE,
   type WorkingStateUpdate,
 } from "./working-state.ts";
-import { validateMemoryWrite, describeRejection } from "./validation.ts";
+import { validateMemoryWrite, describeRejection, validateKeywords } from "./validation.ts";
 
 // ═══════════════════════════════════════════════════════════════
 // Per-extension-instance session state
@@ -198,12 +198,22 @@ export function registerMemoryExtension(
       scope: Type.Optional(Type.String({
         description: "long-term（默认）或 working（只搜索 Scratchpad/最近 Daily）",
       })),
+      category: Type.Optional(Type.String({
+        description: "只搜指定分类（逗号分隔多值）：preference | decision | rule | fact | knowledge",
+      })),
+      max: Type.Optional(Type.Number({
+        description: "最多返回条数，默认 10（1-50）",
+        minimum: 1,
+        maximum: 50,
+      })),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      const { keyword: rawKeyword, includeArchived, scope } = params as {
+      const { keyword: rawKeyword, includeArchived, scope, category, max } = params as {
         keyword: string;
         includeArchived?: boolean;
         scope?: string;
+        category?: string;
+        max?: number;
       };
       const keyword = rawKeyword.trim();
       if (!keyword) {
@@ -223,7 +233,7 @@ export function registerMemoryExtension(
               type: "text",
               text: working.length === 0
                 ? `未在工作状态中找到"${keyword}"。`
-                : working.map((result) => `### ${result.source}\n\n${result.content}`).join("\n\n---\n\n"),
+                : working.map((result) => `### ${result.source}（${result.date || "日期未知"}）\n\n${result.content}`).join("\n\n---\n\n"),
             }],
             details: { keyword, count: working.length, scope: "working" },
           };
@@ -235,16 +245,18 @@ export function registerMemoryExtension(
         const results = await repository.search(keyword, ctx.cwd, {
           includeArchived: includeArchived === true,
           includeProject: projectVisible,
+          max: typeof max === "number" ? max : 10,
+          ...(category ? { category } : {}),
         });
         if (results.length === 0) {
           return {
-            content: [{ type: "text", text: `未找到与"${keyword}"相关的记忆。` }],
+            content: [{ type: "text", text: `未找到与"${keyword}"相关的记忆${category ? `（分类 ${category}）` : ""}。` }],
             details: { keyword, count: 0 },
           };
         }
         const formatted = results.map(({ record, archived }, index) => [
           `### ${index + 1}. ${record.title}`,
-          `**作用域**：${record.scope}${archived ? "（归档）" : ""}　**分类**：${record.category}`,
+          `**作用域**：${record.scope}${archived ? "（归档）" : ""}　**分类**：${record.category}${record.keywords?.length ? `　**关键词**：${record.keywords.join("、")}` : ""}`,
           "",
           record.content,
         ].join("\n")).join("\n\n---\n\n");
@@ -317,6 +329,19 @@ export function registerMemoryExtension(
 
     await repository.markProjectActive(ctx.cwd);
     state.markHot(lifecycle.project.id);
+    // P4：机会性 GC。session_start 是低频点，无物可删时只是几个 readdir 的 no-op。
+    // 失败绝不阻塞 session start（保留策略是软界，下次 session_start 再试）。
+    try {
+      await repository.pruneProject(ctx.cwd);
+    } catch {
+      // Opportunistic prune — ignore failures.
+    }
+    // 写放大：MEMORY.md 延迟重建的落点——脏时才重建，否则 no-op。
+    try {
+      await repository.rebuildPendingIndexes(ctx.cwd);
+    } catch {
+      // Derived convenience index — ignore failures.
+    }
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
@@ -500,6 +525,83 @@ export function registerMemoryExtension(
         ].join("\n"),
         "info",
       );
+    },
+  });
+
+  pi.registerCommand("memory-keywords-backfill", {
+    description: "Batch-fill keywords for records missing them (dry-run by default; append --write to persist)",
+    handler: async (args, ctx) => {
+      // 审计 §3.3-M3 存量回填：对缺 keywords 的旧记录批量调 LLM 补别名（opt-in，带 dry-run）。
+      const write = args.includes("--write");
+      const records = await repository.list(ctx.cwd);
+      const missing = records.filter((r) => !r.keywords || r.keywords.length === 0);
+      if (missing.length === 0) {
+        ctx.ui.notify("所有记录都已有 keywords，无需回填。", "info");
+        return;
+      }
+      if (!ctx.model) {
+        ctx.ui.notify("当前会话无可用模型，无法回填。", "error");
+        return;
+      }
+      ctx.ui.notify(`回填中：${missing.length} 条缺 keywords 的记录（${write ? "写回" : "dry-run，不写盘"}）…`, "info");
+      let filled = 0;
+      for (const record of missing) {
+        try {
+          const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+          if (!auth.ok) throw new Error(auth.error);
+          const resolved = await ctx.modelRegistry.getProviderAuth(ctx.model.provider);
+          const provider = ctx.modelRegistry.getProvider(ctx.model.provider);
+          if (!provider) throw new Error(`Provider unavailable: ${ctx.model.provider}`);
+          const requestModel = resolved?.auth.baseUrl
+            ? { ...ctx.model, baseUrl: resolved.auth.baseUrl }
+            : ctx.model;
+          const response = await provider.streamSimple(requestModel, {
+            systemPrompt:
+              "You add retrieval keywords to existing memory records. Return ONLY a JSON array of 0-5 keywords " +
+              "(each ≤60 chars) covering aliases, acronyms, synonyms a user would search with. Be conservative: " +
+              "prefer fewer, confident keywords; return [] if nothing applies beyond the title itself. No secrets, no commentary.",
+            messages: [{
+              role: "user",
+              content: [{ type: "text", text: `Title: ${record.title}\nContent: ${record.content}` }],
+              timestamp: Date.now(),
+            }],
+            tools: [],
+          }, {
+            apiKey: auth.apiKey,
+            headers: auth.headers,
+            env: auth.env,
+          }).result();
+          if (response.stopReason !== "stop") {
+            throw new Error(response.errorMessage || `Backfill stopped: ${response.stopReason}`);
+          }
+          const text = response.content
+            .filter((c): c is { type: "text"; text: string } => c.type === "text")
+            .map((c) => c.text)
+            .join("\n");
+          const stripped = text.trim().startsWith("```")
+            ? text.trim().replace(/^```(?:json)?\s*\n?/, "").replace(/\n?```\s*$/, "")
+            : text;
+          const parsed = JSON.parse(stripped);
+          const keywords = validateKeywords(parsed);
+          if (!keywords || keywords.length === 0) continue;
+          ctx.ui.notify(`${write ? "回填" : "可回填"} [${record.category}] ${record.title} → ${keywords.join(", ")}`, "info");
+          filled += 1;
+          if (write) {
+            await repository.save({
+              category: record.category,
+              scope: record.scope,
+              cwd: ctx.cwd,
+              title: record.title,
+              content: record.content,
+              keywords,
+              provenance: record.provenance,
+            });
+          }
+        } catch {
+          // 单条失败不阻塞批次。
+        }
+      }
+      ctx.ui.notify(`回填完成：${filled}/${missing.length} 条${write ? "（已写回）" : "（加 --write 写回）"}。`, "info");
     },
   });
 

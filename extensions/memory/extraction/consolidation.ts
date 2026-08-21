@@ -1,6 +1,7 @@
 import type { MemoryRecord } from "../domain.ts";
 import type { ExtractedCandidate } from "./pipeline.ts";
 import type { CandidateSignals } from "./signals.ts";
+import { tokenize } from "./tokenize.ts";
 
 export type ConsolidationAction = "create" | "replace" | "skip";
 
@@ -12,13 +13,9 @@ export interface ConsolidationPlan {
   reason: string;
 }
 
-function tokens(value: string): Set<string> {
-  return new Set(value.toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) || []);
-}
-
 export function similarity(left: string, right: string): number {
-  const a = tokens(left);
-  const b = tokens(right);
+  const a = new Set(tokenize(left));
+  const b = new Set(tokenize(right));
   if (a.size === 0 || b.size === 0) return 0;
   let intersection = 0;
   for (const token of a) if (b.has(token)) intersection += 1;

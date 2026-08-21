@@ -67,6 +67,7 @@ export type ValidationRejection =
   | { kind: "title-too-long"; length: number; max: number }
   | { kind: "empty-content" }
   | { kind: "content-too-long"; length: number; max: number }
+  | { kind: "invalid-keywords"; reason: string }
   | { kind: "contains-secret" };
 
 export function describeRejection(rejection: ValidationRejection): string {
@@ -83,6 +84,8 @@ export function describeRejection(rejection: ValidationRejection): string {
       return "内容不能为空";
     case "content-too-long":
       return `内容过长（${rejection.length}，上限 ${rejection.max}）`;
+    case "invalid-keywords":
+      return `keywords 不合法：${rejection.reason}`;
     case "contains-secret":
       return "内容包含疑似凭证/密钥，已拒绝保存";
   }
@@ -97,6 +100,8 @@ export interface MemoryWriteInput {
   title: string;
   content: string;
   scope?: string;
+  /** 3a M3: optional retrieval keywords. Whitelisted field — unknown keys still rejected elsewhere. */
+  keywords?: string[];
 }
 
 export interface ValidatedMemoryWrite {
@@ -104,6 +109,21 @@ export interface ValidatedMemoryWrite {
   title: string;
   content: string;
   scope: MemoryScope;
+  keywords?: string[];
+}
+
+/** 3a M3: keyword bounds — per audit §3.3-M3: ≤5 terms, each ≤60 chars, non-empty, no secrets. */
+export const MAX_KEYWORDS = 5;
+export const MAX_KEYWORD_LENGTH = 60;
+
+/** Returns undefined for absent, the normalized deduped list for valid, null for invalid. */
+export function validateKeywords(keywords: unknown): string[] | undefined | null {
+  if (keywords === undefined) return undefined;
+  if (!Array.isArray(keywords) || keywords.length > MAX_KEYWORDS) return null;
+  if (keywords.some((k) => typeof k !== "string" || !k.trim() || k.trim().length > MAX_KEYWORD_LENGTH)) return null;
+  const normalized = [...new Set(keywords.map((k) => k.trim()))];
+  if (normalized.some((k) => containsSecret(k))) return null;
+  return normalized.length > 0 ? normalized : undefined;
 }
 
 export function validateMemoryWrite(
@@ -132,11 +152,17 @@ export function validateMemoryWrite(
     return { kind: "contains-secret" };
   }
 
+  // 3a M3：keywords 白名单字段。未提供 → undefined；非法（类型/空/超长/疑似密钥）→ 拒绝。
+  // 未知字段的拒绝不在这里——抽取管线的候选 JSON 是严格 key 集校验（pipeline.ts）。
+  const keywords = validateKeywords(input.keywords);
+  if (keywords === null) return { kind: "invalid-keywords", reason: "必须是 ≤10 个非空字符串，各 ≤40 字符，且不含疑似密钥" };
+
   return {
     category: input.category,
     title,
     content,
     scope: input.scope === "global" ? "global" : "project",
+    ...(keywords ? { keywords } : {}),
   };
 }
 

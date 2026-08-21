@@ -195,6 +195,10 @@ export async function runExtraction(
         content: plan.candidate.content,
         replaceRecordId: plan.action === "replace" ? plan.existing?.id : undefined,
         provenance,
+        // 3a M3：replace 时并集旧 keywords，避免合并/修正把旧别名冲掉。
+        ...(plan.candidate.keywords || plan.existing?.keywords
+          ? { keywords: [...new Set([...(plan.existing?.keywords ?? []), ...(plan.candidate.keywords ?? [])])].slice(0, 5) }
+          : {}),
       };
     }),
     signal,
